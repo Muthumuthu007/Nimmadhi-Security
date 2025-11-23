@@ -1,0 +1,1 @@
+# No Django models - using DynamoDB exclusively
