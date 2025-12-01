@@ -7,6 +7,8 @@ import json
 from backend.dynamodb_service import dynamodb_service
 from botocore.exceptions import ClientError
 from .jwt_utils import generate_jwt_token, decode_jwt_token
+from .token_manager import TokenManager
+from .decorators import jwt_required
 
 logger = logging.getLogger(__name__)
 
@@ -224,3 +226,19 @@ def admin_update_user(request):
     except Exception as e:
         logger.error(f"Error in admin_update_user: {str(e)}")
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+@jwt_required
+def logout_user(request):
+    """Logout user by blacklisting token"""
+    try:
+        token = request.jwt_token
+        if TokenManager.blacklist_token(token):
+            logger.info(f"User logged out: {request.user_info.get('username')}")
+            return JsonResponse({"message": "Logged out successfully"})
+        else:
+            return JsonResponse({"error": "Logout failed"}, status=500)
+    except Exception as e:
+        logger.error(f"Error in logout_user: {e}")
+        return JsonResponse({"error": "Logout failed"}, status=500)

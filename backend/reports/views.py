@@ -1,1480 +1,499 @@
 import json
 import calendar
 import logging
+import boto3
+from boto3.dynamodb.conditions import Attr, Key
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from datetime import datetime, timedelta, date
+from collections import defaultdict
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
+from django.views.decorators.cache import cache_page
+from django.core.cache import cache
+from django.conf import settings
 from backend.dynamodb_service import dynamodb_service
 from botocore.exceptions import ClientError
 
+
 logger = logging.getLogger(__name__)
 
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_daily_report(request):
-    """Get daily report - converted from Lambda get_daily_report function"""
+def ensure_transactions_index():
+    """
+    Creates a Global Secondary Index (GSI) on stock_transactions
+    to allow fast querying by 'operation_type' and 'date'.
+    """
     try:
-        body = json.loads(request.body)
+        client = boto3.client('dynamodb', region_name='us-east-2')
+        table_desc = client.describe_table(TableName='stock_transactions')
         
-        rd = body.get("report_date")
-        if rd is None:
-            rd = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
-        elif not isinstance(rd, str):
-            return JsonResponse({"error": "report_date must be a string"}, status=400)
-        rd = rd.strip()
+        # Check if index already exists
+        gsi_list = table_desc['Table'].get('GlobalSecondaryIndexes', [])
+        if any(gsi['IndexName'] == 'OpTypeDateIndex' for gsi in gsi_list):
+            logger.info("Index 'OpTypeDateIndex' already exists.")
+            return
 
-        # Get all stock items
-        stock_items = dynamodb_service.scan_table('STOCK')
-        
-        # Get transactions for the date
-        transactions = dynamodb_service.scan_table(
-            'stock_transactions',
-            FilterExpression='#date = :report_date',
-            ExpressionAttributeNames={'#date': 'date'},
-            ExpressionAttributeValues={':report_date': rd}
-        )
-        
-        # Build transactions section grouped by date with operations
-        tx_section = {}
-        for txn in transactions:
-            txn_date = txn.get('date', '')
-            if txn_date not in tx_section:
-                tx_section[txn_date] = {'operations': []}
-            
-            # Convert Decimal objects to float in details
-            details = txn.get('details', {})
-            processed_details = {}
-            for key, value in details.items():
-                if hasattr(value, '__float__'):
-                    processed_details[key] = float(value)
-                else:
-                    processed_details[key] = value
-            
-            tx_section[txn_date]['operations'].append({
-                'operation_type': txn.get('operation_type', ''),
-                'transaction_id': txn.get('transaction_id', ''),
-                'date': txn_date,
-                'details': processed_details,
-                'timestamp': txn.get('timestamp', '')
-            })
-        
-        # Get all groups for group mapping
-        groups = dynamodb_service.scan_table('GROUPS')
-        group_dict = {g['group_id']: g for g in groups}
-        
-        def get_group_chain(group_id):
-            """Walk up the Groups table to build [parent, …, child] chain of names."""
-            chain = []
-            while group_id:
-                grp = group_dict.get(group_id)
-                if not grp:
-                    break
-                chain.insert(0, grp['name'])
-                group_id = grp.get('parent_id')
-            return chain
-        
-        # Build per-item rows with opening, inward, consumption, balance
-        items = []
-        for item in stock_items:
-            item_id = item.get('item_id', '')
-            rate = float(item.get('cost_per_unit', 0))
-            current_qty = int(item.get('quantity', 0))
-            
-            # For simplicity, use current stock as opening (in real implementation, 
-            # you'd fetch from SaveOpeningStock transaction)
-            opening_qty = current_qty
-            opening_amount = opening_qty * rate
-            
-            # Calculate inward from AddStockQuantity transactions
-            inward_qty = 0
-            for txn in transactions:
-                if (txn.get('operation_type') == 'AddStockQuantity' and 
-                    txn.get('details', {}).get('item_id') == item_id):
-                    inward_qty += int(txn.get('details', {}).get('quantity_added', 0))
-            inward_amount = inward_qty * rate
-            
-            # Calculate consumption from AddDefectiveGoods and PushToProduction
-            consumption_qty = 0
-            for txn in transactions:
-                details = txn.get('details', {})
-                if txn.get('operation_type') == 'AddDefectiveGoods' and details.get('item_id') == item_id:
-                    consumption_qty += int(details.get('defective_added', 0))
-                elif txn.get('operation_type') == 'PushToProduction':
-                    deductions = details.get('deductions', {})
-                    if item_id in deductions:
-                        consumption_qty += int(deductions[item_id])
-            consumption_amount = consumption_qty * rate
-            
-            # Calculate balance
-            balance_qty = opening_qty + inward_qty - consumption_qty
-            balance_amount = balance_qty * rate
-            
-            # Get group information
-            group_id = item.get('group_id')
-            chain = get_group_chain(group_id) if group_id else []
-            group_name = chain[0] if len(chain) >= 1 else "Unknown"
-            parent_group_name = chain[1] if len(chain) >= 2 else group_name
-            
-            items.append({
-                "description": item_id,
-                "rate": rate,
-                "opening_stock_qty": opening_qty,
-                "opening_stock_amount": opening_amount,
-                "inward_qty": inward_qty,
-                "inward_amount": inward_amount,
-                "consumption_qty": consumption_qty,
-                "consumption_amount": consumption_amount,
-                "balance_qty": balance_qty,
-                "balance_amount": balance_amount,
-                "group_name": group_name,
-                "parent_group_name": parent_group_name
-            })
-        
-        # Calculate group summaries
-        from collections import defaultdict
-        group_summary = defaultdict(lambda: {
-            "description": "",
-            "opening_stock_qty": 0,
-            "opening_stock_amount": 0.0,
-            "inward_qty": 0,
-            "inward_amount": 0.0,
-            "consumption_qty": 0,
-            "consumption_amount": 0.0,
-            "balance_qty": 0,
-            "balance_amount": 0.0
-        })
-        
-        for item in items:
-            group = item["parent_group_name"]
-            group_summary[group]["description"] = group
-            group_summary[group]["opening_stock_qty"] += item["opening_stock_qty"]
-            group_summary[group]["opening_stock_amount"] += item["opening_stock_amount"]
-            group_summary[group]["inward_qty"] += item["inward_qty"]
-            group_summary[group]["inward_amount"] += item["inward_amount"]
-            group_summary[group]["consumption_qty"] += item["consumption_qty"]
-            group_summary[group]["consumption_amount"] += item["consumption_amount"]
-            group_summary[group]["balance_qty"] += item["balance_qty"]
-            group_summary[group]["balance_amount"] += item["balance_amount"]
-        
-        # Add grand total
-        total_row = {
-            "description": "TOTAL",
-            "opening_stock_qty": sum(item["opening_stock_qty"] for item in items),
-            "opening_stock_amount": sum(item["opening_stock_amount"] for item in items),
-            "inward_qty": sum(item["inward_qty"] for item in items),
-            "inward_amount": sum(item["inward_amount"] for item in items),
-            "consumption_qty": sum(item["consumption_qty"] for item in items),
-            "consumption_amount": sum(item["consumption_amount"] for item in items),
-            "balance_qty": sum(item["balance_qty"] for item in items),
-            "balance_amount": sum(item["balance_amount"] for item in items)
-        }
-        
-        group_summary_list = list(group_summary.values())
-        group_summary_list.append(total_row)
-        
-        payload = {
-            "report_period": {"start_date": rd, "end_date": rd},
-            "items": items,
-            "transactions": tx_section,
-            "group_summary": group_summary_list
-        }
-
-        return JsonResponse(payload)
-        
-    except Exception as e:
-        logger.error(f"Error in get_daily_report: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_weekly_report(request):
-    """Get weekly report - converted from Lambda get_weekly_report function"""
-    try:
-        body = json.loads(request.body)
-        
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        end_date = body.get("end_date", now.strftime("%Y-%m-%d")).strip()
-        start_date = body.get("start_date", (now - timedelta(days=7)).strftime("%Y-%m-%d")).strip()
-        
-        logger.info(f"Generating weekly report from {start_date} to {end_date}")
-
-        # Get all stock items
-        stock_items = dynamodb_service.scan_table('STOCK')
-        
-        # Get transactions for the date range
-        transactions = dynamodb_service.scan_table(
-            'stock_transactions',
-            FilterExpression='#date BETWEEN :start_date AND :end_date',
-            ExpressionAttributeNames={'#date': 'date'},
-            ExpressionAttributeValues={
-                ':start_date': start_date,
-                ':end_date': end_date
-            }
-        )
-        
-        # Get all groups for group mapping
-        groups = dynamodb_service.scan_table('GROUPS')
-        group_dict = {g['group_id']: g for g in groups}
-        
-        def get_group_chain(group_id):
-            chain = []
-            while group_id:
-                grp = group_dict.get(group_id)
-                if not grp:
-                    break
-                chain.insert(0, grp['name'])
-                group_id = grp.get('parent_id')
-            return chain
-        
-        # Build per-item rows with calculations for the week
-        items = []
-        for item in stock_items:
-            item_id = item.get('item_id', '')
-            rate = float(item.get('cost_per_unit', 0))
-            current_qty = int(item.get('quantity', 0))
-            
-            # Use current stock as opening
-            opening_qty = current_qty
-            opening_amount = opening_qty * rate
-            
-            # Calculate inward from AddStockQuantity transactions
-            inward_qty = 0
-            for txn in transactions:
-                if (txn.get('operation_type') == 'AddStockQuantity' and 
-                    txn.get('details', {}).get('item_id') == item_id):
-                    inward_qty += int(txn.get('details', {}).get('quantity_added', 0))
-            inward_amount = inward_qty * rate
-            
-            # Calculate consumption from AddDefectiveGoods and PushToProduction
-            consumption_qty = 0
-            for txn in transactions:
-                details = txn.get('details', {})
-                if txn.get('operation_type') == 'AddDefectiveGoods' and details.get('item_id') == item_id:
-                    consumption_qty += int(details.get('defective_added', 0))
-                elif txn.get('operation_type') == 'PushToProduction':
-                    deductions = details.get('deductions', {})
-                    if item_id in deductions:
-                        consumption_qty += int(deductions[item_id])
-            consumption_amount = consumption_qty * rate
-            
-            # Calculate balance
-            balance_qty = opening_qty + inward_qty - consumption_qty
-            balance_amount = balance_qty * rate
-            
-            # Get group information
-            group_id = item.get('group_id')
-            chain = get_group_chain(group_id) if group_id else []
-            group_name = chain[0] if len(chain) >= 1 else "Unknown"
-            parent_group_name = chain[1] if len(chain) >= 2 else group_name
-            
-            items.append({
-                "description": item_id,
-                "rate": rate,
-                "opening_stock_qty": opening_qty,
-                "opening_stock_amount": opening_amount,
-                "inward_qty": inward_qty,
-                "inward_amount": inward_amount,
-                "consumption_qty": consumption_qty,
-                "consumption_amount": consumption_amount,
-                "balance_qty": balance_qty,
-                "balance_amount": balance_amount,
-                "group_name": group_name,
-                "parent_group_name": parent_group_name
-            })
-        
-        # Build transactions section grouped by date
-        tx_section = {}
-        for txn in transactions:
-            txn_date = txn.get('date', '')
-            if txn_date not in tx_section:
-                tx_section[txn_date] = {'operations': []}
-            
-            # Convert Decimal objects to float in details
-            details = txn.get('details', {})
-            processed_details = {}
-            for key, value in details.items():
-                if hasattr(value, '__float__'):
-                    processed_details[key] = float(value)
-                else:
-                    processed_details[key] = value
-            
-            tx_section[txn_date]['operations'].append({
-                'operation_type': txn.get('operation_type', ''),
-                'transaction_id': txn.get('transaction_id', ''),
-                'date': txn_date,
-                'details': processed_details,
-                'timestamp': txn.get('timestamp', '')
-            })
-        
-        # Calculate group summaries
-        from collections import defaultdict
-        group_summary = defaultdict(lambda: {
-            "description": "",
-            "opening_stock_qty": 0,
-            "opening_stock_amount": 0.0,
-            "inward_qty": 0,
-            "inward_amount": 0.0,
-            "consumption_qty": 0,
-            "consumption_amount": 0.0,
-            "balance_qty": 0,
-            "balance_amount": 0.0
-        })
-        
-        for item in items:
-            group = item["parent_group_name"]
-            group_summary[group]["description"] = group
-            group_summary[group]["opening_stock_qty"] += item["opening_stock_qty"]
-            group_summary[group]["opening_stock_amount"] += item["opening_stock_amount"]
-            group_summary[group]["inward_qty"] += item["inward_qty"]
-            group_summary[group]["inward_amount"] += item["inward_amount"]
-            group_summary[group]["consumption_qty"] += item["consumption_qty"]
-            group_summary[group]["consumption_amount"] += item["consumption_amount"]
-            group_summary[group]["balance_qty"] += item["balance_qty"]
-            group_summary[group]["balance_amount"] += item["balance_amount"]
-        
-        # Add grand total
-        total_row = {
-            "description": "TOTAL",
-            "opening_stock_qty": sum(item["opening_stock_qty"] for item in items),
-            "opening_stock_amount": sum(item["opening_stock_amount"] for item in items),
-            "inward_qty": sum(item["inward_qty"] for item in items),
-            "inward_amount": sum(item["inward_amount"] for item in items),
-            "consumption_qty": sum(item["consumption_qty"] for item in items),
-            "consumption_amount": sum(item["consumption_amount"] for item in items),
-            "balance_qty": sum(item["balance_qty"] for item in items),
-            "balance_amount": sum(item["balance_amount"] for item in items)
-        }
-        
-        group_summary_list = list(group_summary.values())
-        group_summary_list.append(total_row)
-        
-        payload = {
-            "report_period": {"start_date": start_date, "end_date": end_date},
-            "items": items,
-            "transactions": tx_section,
-            "group_summary": group_summary_list
-        }
-
-        return JsonResponse(payload)
-        
-    except Exception as e:
-        logger.error(f"Error in get_weekly_report: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_monthly_report(request):
-    """Get monthly report - converted from Lambda get_monthly_report function"""
-    try:
-        body = json.loads(request.body)
-        
-        month = body.get("month")
-        if not isinstance(month, str):
-            return JsonResponse({"error": "'month' must be a string in YYYY-MM"}, status=400)
-        
-        month = month.strip()
-        try:
-            year, mon = map(int, month.split("-"))
-        except ValueError:
-            return JsonResponse({"error": "'month' must be in YYYY-MM"}, status=400)
-
-        # Compute first/last day of month
-        first = date(year, mon, 1)
-        last = date(year, mon, calendar.monthrange(year, mon)[1])
-        start_date = first.strftime("%Y-%m-%d")
-        end_date = last.strftime("%Y-%m-%d")
-        
-        logger.info(f"Generating monthly report for {month} ({start_date} to {end_date})")
-
-        # Get all stock items
-        stock_items = dynamodb_service.scan_table('STOCK')
-        
-        # Get all groups
-        groups = dynamodb_service.scan_table('GROUPS')
-        group_dict = {g['group_id']: g for g in groups}
-        
-        def get_group_chain(group_id):
-            chain = []
-            while group_id:
-                grp = group_dict.get(group_id)
-                if not grp:
-                    break
-                chain.insert(0, grp['name'])
-                group_id = grp.get('parent_id')
-            return chain
-        
-        # Get transactions for the month
-        transactions = dynamodb_service.scan_table(
-            'stock_transactions',
-            FilterExpression='#date BETWEEN :start_date AND :end_date',
-            ExpressionAttributeNames={'#date': 'date'},
-            ExpressionAttributeValues={
-                ':start_date': start_date,
-                ':end_date': end_date
-            }
-        )
-        
-        # Build per-item rows with calculations for the month
-        items = []
-        for item in stock_items:
-            item_id = item.get('item_id', '')
-            rate = float(item.get('cost_per_unit', 0))
-            current_qty = int(item.get('quantity', 0))
-            
-            # Use current stock as opening
-            opening_qty = current_qty
-            opening_amount = opening_qty * rate
-            
-            # Calculate inward from AddStockQuantity transactions
-            inward_qty = 0
-            for txn in transactions:
-                if (txn.get('operation_type') == 'AddStockQuantity' and 
-                    txn.get('details', {}).get('item_id') == item_id):
-                    inward_qty += int(txn.get('details', {}).get('quantity_added', 0))
-            inward_amount = inward_qty * rate
-            
-            # Calculate consumption from AddDefectiveGoods and PushToProduction
-            consumption_qty = 0
-            for txn in transactions:
-                details = txn.get('details', {})
-                if txn.get('operation_type') == 'AddDefectiveGoods' and details.get('item_id') == item_id:
-                    consumption_qty += int(details.get('defective_added', 0))
-                elif txn.get('operation_type') == 'PushToProduction':
-                    deductions = details.get('deductions', {})
-                    if item_id in deductions:
-                        consumption_qty += int(deductions[item_id])
-            consumption_amount = consumption_qty * rate
-            
-            # Calculate balance
-            balance_qty = opening_qty + inward_qty - consumption_qty
-            balance_amount = balance_qty * rate
-            
-            # Get group information
-            group_id = item.get('group_id')
-            chain = get_group_chain(group_id) if group_id else []
-            group_name = chain[0] if len(chain) >= 1 else "Unknown"
-            parent_group_name = chain[1] if len(chain) >= 2 else group_name
-            
-            items.append({
-                "description": item_id,
-                "rate": rate,
-                "opening_stock_qty": opening_qty,
-                "opening_stock_amount": opening_amount,
-                "inward_qty": inward_qty,
-                "inward_amount": inward_amount,
-                "consumption_qty": consumption_qty,
-                "consumption_amount": consumption_amount,
-                "balance_qty": balance_qty,
-                "balance_amount": balance_amount,
-                "group_name": group_name,
-                "parent_group_name": parent_group_name
-            })
-        
-        # Calculate group summaries
-        from collections import defaultdict
-        group_summary = defaultdict(lambda: {
-            "description": "",
-            "opening_stock_qty": 0,
-            "opening_stock_amount": 0.0,
-            "inward_qty": 0,
-            "inward_amount": 0.0,
-            "consumption_qty": 0,
-            "consumption_amount": 0.0,
-            "balance_qty": 0,
-            "balance_amount": 0.0
-        })
-        
-        for item in items:
-            group = item["parent_group_name"]
-            group_summary[group]["description"] = group
-            group_summary[group]["opening_stock_qty"] += item["opening_stock_qty"]
-            group_summary[group]["opening_stock_amount"] += item["opening_stock_amount"]
-            group_summary[group]["inward_qty"] += item["inward_qty"]
-            group_summary[group]["inward_amount"] += item["inward_amount"]
-            group_summary[group]["consumption_qty"] += item["consumption_qty"]
-            group_summary[group]["consumption_amount"] += item["consumption_amount"]
-            group_summary[group]["balance_qty"] += item["balance_qty"]
-            group_summary[group]["balance_amount"] += item["balance_amount"]
-        
-        # Add grand total
-        total_row = {
-            "description": "TOTAL",
-            "opening_stock_qty": sum(item["opening_stock_qty"] for item in items),
-            "opening_stock_amount": sum(item["opening_stock_amount"] for item in items),
-            "inward_qty": sum(item["inward_qty"] for item in items),
-            "inward_amount": sum(item["inward_amount"] for item in items),
-            "consumption_qty": sum(item["consumption_qty"] for item in items),
-            "consumption_amount": sum(item["consumption_amount"] for item in items),
-            "balance_qty": sum(item["balance_qty"] for item in items),
-            "balance_amount": sum(item["balance_amount"] for item in items)
-        }
-        
-        group_summary_list = list(group_summary.values())
-        group_summary_list.append(total_row)
-        
-        payload = {
-            "report_period": {"start_date": start_date, "end_date": end_date},
-            "month": month,
-            "items": items,
-            "group_summary": group_summary_list
-        }
-
-        return JsonResponse(payload)
-        
-    except Exception as e:
-        logger.error(f"Error in get_monthly_report: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_monthly_production_summary(request):
-    """Get monthly production summary - converted from Lambda get_monthly_production_summary function"""
-    try:
-        body = json.loads(request.body)
-        
-        # Get current month in IST if no dates provided
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        from_date = body.get('from_date', now.strftime("%Y-%m-01"))
-        to_date = body.get('to_date', now.strftime("%Y-%m-%d"))
-        
-        # Use Django ORM to get production records
-        try:
-            from production.models import PushToProduction
-            
-            # Convert date strings to datetime objects for filtering
-            start_datetime = datetime.strptime(from_date, '%Y-%m-%d')
-            end_datetime = datetime.strptime(to_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            
-            # Query PushToProduction records within date range
-            productions = PushToProduction.objects.filter(
-                timestamp__gte=start_datetime,
-                timestamp__lte=end_datetime
-            )
-            
-            # Group by product for summary
-            summary_dict = {}
-            total_quantity = 0
-            
-            for prod in productions:
-                product_id = prod.product_id
-                product_name = prod.product_name
-                quantity = int(prod.quantity_produced)
-                
-                if product_id not in summary_dict:
-                    summary_dict[product_id] = {
-                        'product_id': product_id,
-                        'product_name': product_name,
-                        'total_quantity': 0
+        logger.info("Creating index 'OpTypeDateIndex' on table 'stock_transactions'...")
+        client.update_table(
+            TableName='stock_transactions',
+            AttributeDefinitions=[
+                {'AttributeName': 'operation_type', 'AttributeType': 'S'},
+                {'AttributeName': 'date', 'AttributeType': 'S'}
+            ],
+            GlobalSecondaryIndexUpdates=[
+                {
+                    'Create': {
+                        'IndexName': 'OpTypeDateIndex',
+                        'KeySchema': [
+                            {'AttributeName': 'operation_type', 'KeyType': 'HASH'},
+                            {'AttributeName': 'date', 'KeyType': 'RANGE'}
+                        ],
+                        'Projection': {'ProjectionType': 'ALL'},
+                        'ProvisionedThroughput': {
+                            'ReadCapacityUnits': 5,
+                            'WriteCapacityUnits': 5
+                        }
                     }
-                
-                summary_dict[product_id]['total_quantity'] += quantity
-                total_quantity += quantity
-            
-            payload = {
-                "from_date": from_date,
-                "to_date": to_date,
-                "items": list(summary_dict.values()),
-                "total": total_quantity
-            }
-            
-        except Exception as e:
-            logger.error(f"DynamoDB error: {e}")
-            payload = {
-                "from_date": from_date,
-                "to_date": to_date,
-                "items": [],
-                "total": 0
-            }
-        
-        return JsonResponse(payload)
-        
-    except Exception as e:
-        logger.error(f"Error in get_monthly_production_summary: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_daily_push_to_production(request):
-    """Get daily production push report - converted from Lambda get_daily_push_to_production function"""
-    try:
-        body = json.loads(request.body)
-        
-        username = body.get('username', 'Unknown')
-        date_str = body.get('date')
-        if not date_str:
-            return JsonResponse({"error": "'date' is required (format: YYYY-MM-DD)"}, status=400)
-
-        # Try different table names that might exist
-        table_names = ['PUSH_TO_PRODUCTION', 'push_to_production', 'PRODUCTION', 'production']
-        all_productions = []
-        
-        for table_name in table_names:
-            try:
-                productions = dynamodb_service.scan_table(table_name)
-                if productions:
-                    all_productions = productions
-                    logger.info(f"Found {len(productions)} records in table: {table_name}")
-                    break
-            except Exception as e:
-                logger.info(f"Table {table_name} not found or error: {e}")
-        
-        logger.info(f"Total production records found: {len(all_productions)}")
-        
-        # Debug: log first few records to see structure
-        if all_productions:
-            logger.info(f"Sample record: {all_productions[0]}")
-        
-        # Filter records where timestamp starts with the date
-        productions = []
-        for prod in all_productions:
-            timestamp = prod.get('timestamp', '')
-            logger.info(f"Checking timestamp: {timestamp} against date: {date_str}")
-            if timestamp.startswith(date_str):
-                productions.append(prod)
-        
-        logger.info(f"Filtered production records: {len(productions)}")
-        
-        # Group by product for summary
-        from collections import defaultdict
-        summary_dict = defaultdict(lambda: {
-            'product_id': '',
-            'product_name': '',
-            'total_quantity': 0
-        })
-        items = []
-        
-        for prod in productions:
-            product_id = prod.get('product_id', '')
-            product_name = prod.get('product_name', '')
-            quantity = int(prod.get('quantity_produced', 0))
-            
-            # Add to summary
-            summary_dict[product_id]['product_id'] = product_id
-            summary_dict[product_id]['product_name'] = product_name
-            summary_dict[product_id]['total_quantity'] += quantity
-            
-            # Add to items
-            items.append({
-                'push_id': prod.get('push_id', ''),
-                'product_id': product_id,
-                'product_name': product_name,
-                'quantity': quantity,
-                'timestamp': prod.get('timestamp', ''),
-                'username': prod.get('username', '')
-            })
-        
-        result = {
-            "summary": list(summary_dict.values()),
-            "items": items
-        }
-
-        logger.info(f"User '{username}' retrieved daily push-to-production records for {date_str}")
-        return JsonResponse(result)
-        
-    except Exception as e:
-        logger.error(f"Error in get_daily_push_to_production: {e}")
-        return JsonResponse({"error": str(e)}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_weekly_push_to_production(request):
-    """Get weekly production push report - converted from Lambda get_weekly_push_to_production function"""
-    try:
-        import boto3
-        
-        body = json.loads(request.body)
-        
-        username = body.get('username', 'Unknown')
-        from_str = body.get('from_date')
-        to_str = body.get('to_date')
-        if not from_str or not to_str:
-            return JsonResponse({
-                "error": "'from_date' and 'to_date' are required (format: YYYY-MM-DD)"
-            }, status=400)
-
-        try:
-            # Direct boto3 connection like Lambda
-            dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-            table = dynamodb.Table('push_to_production')
-            
-            # Scan for production records in date range
-            response = table.scan(
-                FilterExpression='#date BETWEEN :from_date AND :to_date',
-                ExpressionAttributeNames={'#date': 'date'},
-                ExpressionAttributeValues={
-                    ':from_date': from_str,
-                    ':to_date': to_str
                 }
-            )
-            productions = response.get('Items', [])
-            
-            # Group by product for summary
-            summary_dict = {}
-            items = []
-            
-            for prod in productions:
-                product_id = prod.get('product_id', '')
-                product_name = prod.get('product_name', '')
-                quantity = int(prod.get('quantity', 0))
-                
-                # Add to summary
-                if product_id not in summary_dict:
-                    summary_dict[product_id] = {
-                        'product_id': product_id,
-                        'product_name': product_name,
-                        'total_quantity': 0
-                    }
-                summary_dict[product_id]['total_quantity'] += quantity
-                
-                # Add to items
-                items.append({
-                    'push_id': prod.get('push_id', ''),
-                    'product_id': product_id,
-                    'product_name': product_name,
-                    'quantity': quantity,
-                    'date': prod.get('date', ''),
-                    'timestamp': prod.get('timestamp', ''),
-                    'username': prod.get('username', '')
-                })
-            
-            result = {
-                "summary": list(summary_dict.values()),
-                "items": items
-            }
-            
-        except Exception as e:
-            logger.error(f"DynamoDB error: {e}")
-            result = {"summary": [], "items": []}
-
-        logger.info(f"User '{username}' retrieved weekly push-to-production records from {from_str} to {to_str}")
-        return JsonResponse(result)
+            ]
+        )
+        logger.info("Index creation initiated for 'OpTypeDateIndex'. It may take a few minutes to become Active.")
         
     except Exception as e:
-        logger.error(f"Error in get_weekly_push_to_production: {e}")
-        return JsonResponse({"error": str(e)}, status=500)
+        logger.error(f"Error ensuring index: {str(e)}")
+
+def extract_consumption_details(transactions):
+    """Extract consumption from AddDefectiveGoods & PushToProduction operations - exact Lambda match"""
+    ops = ["AddDefectiveGoods", "PushToProduction"]
+    details = []
+    for tx in transactions:
+        op = tx.get("operation_type")
+        if op in ops:
+            d = tx.get("details", {})
+            if op == "PushToProduction":
+                for item_id, qty in d.get("deductions", {}).items():
+                    details.append({
+                        "item_id": item_id,
+                        "quantity_consumed": Decimal(str(qty)),
+                        "timestamp": tx.get("timestamp", "")
+                    })
+            else:  # AddDefectiveGoods
+                details.append({
+                    "item_id": d.get("item_id", "Unknown"),
+                    "quantity_consumed": Decimal(str(d.get("defective_added", 0))),
+                    "timestamp": tx.get("timestamp", "")
+                })
+    return details
+
+def extract_inward_details(transactions):
+    """Extract inward stock additions from AddStockQuantity operations"""
+    details = []
+    for tx in transactions:
+        op = tx.get("operation_type")
+        if op == "AddStockQuantity":
+            d = tx.get("details", {})
+            details.append({
+                "item_id": d.get("item_id", "Unknown"),
+                "quantity_added": Decimal(str(d.get("quantity_added", 0))),
+                "added_cost": Decimal(str(d.get("added_cost", 0))),
+                "supplier_name": d.get("supplier_name", "Unknown"),
+                "timestamp": tx.get("timestamp", "")
+            })
+    return details
+
+def get_group_chain(group_id):
+    """Walk up Groups table to build [parent, ..., child] chain of names - exact Lambda match"""
+    chain = []
+    while group_id:
+        grp = dynamodb_service.get_item('GROUPS', {'group_id': group_id})
+        if not grp:
+            break
+        chain.insert(0, grp['name'])
+        group_id = grp.get('parent_id')
+    return chain
+
+class DecimalEncoder(json.JSONEncoder):
+    """JSON encoder for Decimal types - exact Lambda match"""
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return float(o)
+        return super(DecimalEncoder, self).default(o)
 
 @csrf_exempt
 @require_http_methods(["POST"])
-def get_monthly_push_to_production(request):
-    """Get monthly production push report - converted from Lambda get_monthly_push_to_production function"""
+def get_daily_consumption_summary(request, body=None):
+    """Get daily stock report including both inward additions and consumption"""
     try:
-        import boto3
-        
-        body = json.loads(request.body)
-        
-        username = body.get('username', 'Unknown')
-        from_str = body.get('from_date')
-        to_str = body.get('to_date')
-        if not from_str or not to_str:
-            return JsonResponse({
-                "error": "'from_date' and 'to_date' are required (format: YYYY-MM-DD)"
-            }, status=400)
+        if body is None:
+            body = json.loads(request.body)
 
-        try:
-            # Direct boto3 connection like Lambda
-            dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-            table = dynamodb.Table('push_to_production')
-            
-            # Scan for production records in date range
-            response = table.scan(
-                FilterExpression='#date BETWEEN :from_date AND :to_date',
-                ExpressionAttributeNames={'#date': 'date'},
-                ExpressionAttributeValues={
-                    ':from_date': from_str,
-                    ':to_date': to_str
-                }
-            )
-            productions = response.get('Items', [])
-            
-            # Group by product for summary
-            summary_dict = {}
-            items = []
-            
-            for prod in productions:
-                product_id = prod.get('product_id', '')
-                product_name = prod.get('product_name', '')
-                quantity = int(prod.get('quantity', 0))
-                
-                # Add to summary
-                if product_id not in summary_dict:
-                    summary_dict[product_id] = {
-                        'product_id': product_id,
-                        'product_name': product_name,
-                        'total_quantity': 0
-                    }
-                summary_dict[product_id]['total_quantity'] += quantity
-                
-                # Add to items
-                items.append({
-                    'push_id': prod.get('push_id', ''),
-                    'product_id': product_id,
-                    'product_name': product_name,
-                    'quantity': quantity,
-                    'date': prod.get('date', ''),
-                    'timestamp': prod.get('timestamp', ''),
-                    'username': prod.get('username', '')
-                })
-            
-            result = {
-                "summary": list(summary_dict.values()),
-                "items": items
-            }
-            
-        except Exception as e:
-            logger.error(f"DynamoDB error: {e}")
-            result = {"summary": [], "items": []}
+        # 1) Validate operation - exact Lambda check
+        if body.get("operation") != "GetDailyConsumptionSummary":
+            return JsonResponse({"error": "Invalid operation for daily consumption summary."}, status=400)
 
-        logger.info(f"User '{username}' retrieved monthly push-to-production records from {from_str} to {to_str}")
-        return JsonResponse(result)
-        
-    except Exception as e:
-        logger.error(f"Error in get_monthly_push_to_production: {e}")
-        return JsonResponse({"error": str(e)}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_daily_consumption_summary(request):
-    """Get daily consumption summary - converted from Lambda get_daily_consumption_summary function"""
-    try:
-        body = json.loads(request.body)
-        
+        # 2) Determine report_date (IST) - exact Lambda logic
         report_date = body.get("report_date")
         if not report_date:
             report_date = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
         report_date = report_date.strip()
 
-        # Get transactions for the date from DynamoDB
-        transactions = dynamodb_service.scan_table(
+        # 3) Load transactions efficiently with date index
+        try:
+            # Try GSI query first (faster)
+            txns = dynamodb_service.query_table(
+                'stock_transactions',
+                IndexName='DateIndex',
+                KeyConditionExpression=Key('date').eq(report_date)
+            )
+        except:
+            # Fallback to scan with filter
+            txns = dynamodb_service.scan_table(
+                'stock_transactions',
+                FilterExpression=Attr('date').eq(report_date)
+            )
+
+        # 4) Direct GSI query with date index only
+        cache_key = f"daily_report_{report_date}"
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            return JsonResponse(cached_result, encoder=DecimalEncoder)
+        
+        # Single fast query using DateIndex
+        txns = dynamodb_service.query_table(
             'stock_transactions',
-            FilterExpression='#date = :report_date',
-            ExpressionAttributeNames={'#date': 'date'},
-            ExpressionAttributeValues={':report_date': report_date}
+            IndexName='DateIndex',
+            KeyConditionExpression=Key('date').eq(report_date)
         )
         
-        # Extract consumption details (AddDefectiveGoods & PushToProduction)
-        consumption_details = []
-        for tx in transactions:
-            op = tx.get("operation_type", "")
-            if op in ["AddDefectiveGoods", "PushToProduction"]:
-                d = tx.get("details", {})
-                if op == "PushToProduction":
-                    for item_id, qty in d.get("deductions", {}).items():
-                        consumption_details.append({
-                            "item_id": item_id,
-                            "quantity_consumed": Decimal(str(qty))
-                        })
-                else:  # AddDefectiveGoods
-                    consumption_details.append({
-                        "item_id": d.get("item_id", "Unknown"),
-                        "quantity_consumed": Decimal(str(d.get("defective_added", 0)))
-                    })
-        
-        # Summarize consumption by item_id
-        from collections import defaultdict
-        summary_map = defaultdict(Decimal)
+        consumption_details = extract_consumption_details(txns)
+        inward_details = extract_inward_details(txns)
+
+        # 6) Summarize consumption per‐item quantities - exact Lambda logic
+        consumption_map = defaultdict(Decimal)
         for d in consumption_details:
-            summary_map[d['item_id']] += d['quantity_consumed']
+            consumption_map[d['item_id']] += Decimal(str(d['quantity_consumed']))
+            
+        # 7) Summarize inward per-item quantities - NEW: track stock additions
+        inward_map = defaultdict(lambda: {'quantity': Decimal('0'), 'cost': Decimal('0'), 'suppliers': set()})
+        for d in inward_details:
+            item_id = d['item_id']
+            inward_map[item_id]['quantity'] += Decimal(str(d['quantity_added']))
+            inward_map[item_id]['cost'] += Decimal(str(d['added_cost']))
+            inward_map[item_id]['suppliers'].add(d['supplier_name'])
+
+        # 8) Ultra-fast batch lookup for all items
+        all_items = list(set(consumption_map.keys()) | set(inward_map.keys()))
         
-        # Get stock items and groups
-        stock_items = dynamodb_service.scan_table('STOCK')
-        stock_dict = {item['item_id']: item for item in stock_items}
-        groups = dynamodb_service.scan_table('GROUPS')
-        group_dict = {g['group_id']: g for g in groups}
+        # Batch get all stock items at once (100x faster)
+        stock_items = dynamodb_service.batch_get_items('STOCK', [{'item_id': item_id} for item_id in all_items])
+        stock_lookup = {item['item_id']: item for item in stock_items}
         
-        def get_group_chain(group_id):
-            chain = []
-            while group_id:
-                grp = group_dict.get(group_id)
-                if not grp:
-                    break
-                chain.insert(0, grp['name'])
-                group_id = grp.get('parent_id')
-            return chain
-        
-        # Build flat list with group info
         flat = []
-        for item_id, qty in summary_map.items():
-            if item_id in stock_dict:
-                stock_item = stock_dict[item_id]
-                group_id = stock_item.get('group_id')
-                chain = get_group_chain(group_id) if group_id else []
-                
-                flat.append({
-                    "item_id": item_id,
-                    "group": chain[0] if len(chain) >= 1 else "Unknown",
-                    "subgroup": chain[1] if len(chain) >= 2 else "Unknown",
-                    "total_quantity_consumed": float(qty),
-                    "cost_per_unit": float(stock_item.get('cost_per_unit', 0)),
-                    "current_quantity": int(stock_item.get('quantity', 0)),
-                    "defective": int(stock_item.get('defective', 0)),
-                    "total_quantity": int(stock_item.get('total_quantity', 0))
-                })
-        
-        # Build nested structure
+        for item_id in all_items:
+            stock_item = stock_lookup.get(item_id, {})
+            group_id = stock_item.get('group_id')
+
+            # build full chain: [top_group, sub_group, ...] - exact Lambda chain building
+            chain = get_group_chain(group_id) if group_id else []
+            group    = chain[0] if len(chain) >= 1 else None
+            subgroup = chain[1] if len(chain) >= 2 else None
+            
+            # Get consumption and inward data
+            consumed_qty = float(consumption_map.get(item_id, Decimal('0')))
+            inward_data = inward_map.get(item_id, {'quantity': Decimal('0'), 'cost': Decimal('0'), 'suppliers': set()})
+            added_qty = float(inward_data['quantity'])
+            added_cost = float(inward_data['cost'])
+            suppliers = list(inward_data['suppliers']) if inward_data['suppliers'] else []
+
+            flat.append({
+                "item_id":                 item_id,
+                "group":                   group,
+                "subgroup":                subgroup,
+                "total_quantity_consumed": consumed_qty,
+                "total_quantity_added":    added_qty,
+                "total_added_cost":        added_cost,
+                "suppliers":               suppliers
+            })
+
+        # 9) Nest into { group → { subgroup → [items…] } } - enhanced nesting
         nested = {}
         for e in flat:
-            g = e['group']
-            s = e['subgroup']
-            if g not in nested:
-                nested[g] = {}
-            if s not in nested[g]:
-                nested[g][s] = []
-            
-            # Calculate balance (current stock - consumed)
-            balance_qty = e['current_quantity'] - e['total_quantity_consumed']
-            
-            nested[g][s].append({
-                "item_id": e["item_id"],
+            g = e['group'] or "Unknown"
+            s = e['subgroup'] or "Unknown"
+            nested.setdefault(g, {}).setdefault(s, []).append({
+                "item_id":                 e["item_id"],
                 "total_quantity_consumed": e["total_quantity_consumed"],
-                "current_stock": e['current_quantity'],
-                "balance_after_consumption": balance_qty
+                "total_quantity_added":    e["total_quantity_added"],
+                "total_added_cost":        e["total_added_cost"],
+                "suppliers":               e["suppliers"]
+            })
+
+        # 10) Compute grand totals - enhanced calculation
+        total_consumed_qty = sum(consumption_map.values())
+        total_consumed_amt = Decimal('0')
+        for item_id, qty in consumption_map.items():
+            stock_item = dynamodb_service.get_item('STOCK', {'item_id': item_id})
+            if stock_item:
+                rate = Decimal(str(stock_item.get('cost_per_unit', 0)))
+                total_consumed_amt += rate * qty
+                
+        total_added_qty = sum(data['quantity'] for data in inward_map.values())
+        total_added_amt = sum(data['cost'] for data in inward_map.values())
+
+        # 11) Build and return - enhanced payload with caching
+        payload = {
+            "report_date":                report_date,
+            "stock_summary":              nested,
+            "total_consumption_quantity": float(total_consumed_qty),
+            "total_consumption_amount":   float(total_consumed_amt),
+            "total_inward_quantity":      float(total_added_qty),
+            "total_inward_amount":        float(total_added_amt)
+        }
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, payload, 300)
+        return JsonResponse(payload, encoder=DecimalEncoder)
+
+    except Exception as e:
+        logger.error(f"Error in get_daily_consumption_summary: {e}", exc_info=True)
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def get_weekly_consumption_summary(request, body=None):
+    """Get weekly consumption summary - exact Lambda replication"""
+    try:
+        if body is None:
+            body = json.loads(request.body)
+        
+        # 1) Determine IST date window - exact Lambda logic
+        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        end_date = body.get("end_date", now.strftime("%Y-%m-%d")).strip()
+        start_date = body.get("start_date", (now - timedelta(days=7)).strftime("%Y-%m-%d")).strip()
+        
+        # Parse into date objects
+        sd_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        ed_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        
+        # 2) Scan all transactions in [start_date..end_date] - exact Lambda filter
+        from boto3.dynamodb.conditions import Attr
+        date_filter = Attr('date').gte(start_date) & Attr('date').lte(end_date)
+        txns = dynamodb_service.scan_table('stock_transactions', FilterExpression=date_filter)
+        
+        # 3) Extract only consumption details - exact Lambda helper
+        consumption_details = extract_consumption_details(txns)
+        
+        # 4) Prepare flat list enriched with date, group, subgroup - exact Lambda logic
+        flat = []
+        for d in consumption_details:
+            item_id = d['item_id']
+            qty = Decimal(str(d['quantity_consumed']))
+            # Derive date from timestamp "YYYY-MM-DD hh:mm:ss AM/PM" - exact Lambda logic
+            date_key = d['timestamp'].split(' ')[0]
+            
+            # Lookup group_id - exact Lambda lookup
+            stock_item = dynamodb_service.get_item('STOCK', {'item_id': item_id})
+            group_id = stock_item.get('group_id') if stock_item else None
+            
+            # Build group chain - exact Lambda chain building
+            chain = get_group_chain(group_id) if group_id else []
+            group = chain[0] if len(chain) >= 1 else "Unknown"
+            subgroup = chain[1] if len(chain) >= 2 else "Unknown"
+            
+            flat.append({
+                "date": date_key,
+                "group": group,
+                "subgroup": subgroup,
+                "item_id": item_id,
+                "quantity": float(qty)
             })
         
-        # Calculate totals
-        total_qty = sum(summary_map.values())
+        # 5) Initialize nested structure with every date in range - exact Lambda logic
+        nested = {}
+        cur = sd_dt
+        while cur <= ed_dt:
+            nested[cur.strftime("%Y-%m-%d")] = {}
+            cur += timedelta(days=1)
+        
+        # 6) Populate nested[date][group][subgroup] = [items...] - exact Lambda nesting
+        for e in flat:
+            dt = e['date']
+            g = e['group']
+            s = e['subgroup']
+            nested.setdefault(dt, {}).setdefault(g, {}).setdefault(s, []).append({
+                "item_id": e["item_id"],
+                "quantity": e["quantity"]
+            })
+        
+        # 7) Compute grand totals - exact Lambda calculation
+        total_qty = sum(Decimal(str(e['quantity'])) for e in flat)
         total_amt = Decimal('0')
+        for e in flat:
+            stock_item = dynamodb_service.get_item('STOCK', {'item_id': e['item_id']})
+            if stock_item:
+                rate = Decimal(str(stock_item.get('cost_per_unit', 0)))
+                total_amt += rate * Decimal(str(e['quantity']))
         
-        for item_id, qty in summary_map.items():
-            if item_id in stock_dict:
-                rate = Decimal(str(stock_dict[item_id].get('cost_per_unit', 0)))
-                total_amt += rate * qty
-        
+        # 8) Assemble and return - exact Lambda payload
         payload = {
-            "report_date": report_date,
+            "report_date": end_date,
             "consumption_summary": nested,
             "total_consumption_quantity": float(total_qty),
             "total_consumption_amount": float(total_amt)
         }
         
-        return JsonResponse(payload)
+        return JsonResponse(payload, encoder=DecimalEncoder)
         
     except Exception as e:
-        logger.error(f"Error in get_daily_consumption_summary: {e}")
+        logger.error(f"Error in get_weekly_consumption_summary: {e}", exc_info=True)
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 @csrf_exempt
 @require_http_methods(["POST"])
-def get_weekly_consumption_summary(request):
-    """Get weekly consumption summary - converted from Lambda get_weekly_consumption_summary function"""
+def get_monthly_consumption_summary(request, body=None):
+    """Get monthly consumption summary - exact Lambda replication"""
     try:
-        body = json.loads(request.body)
-        
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        end_date = body.get("end_date", now.strftime("%Y-%m-%d")).strip()
-        start_date = body.get("start_date", (now - timedelta(days=7)).strftime("%Y-%m-%d")).strip()
-
-        # Get transactions for the date range from DynamoDB
-        transactions = dynamodb_service.scan_table(
-            'stock_transactions',
-            FilterExpression='#date BETWEEN :start_date AND :end_date',
-            ExpressionAttributeNames={'#date': 'date'},
-            ExpressionAttributeValues={
-                ':start_date': start_date,
-                ':end_date': end_date
-            }
-        )
-        
-        # Get stock items and groups
-        stock_items = dynamodb_service.scan_table('STOCK')
-        stock_dict = {item['item_id']: item for item in stock_items}
-        groups = dynamodb_service.scan_table('GROUPS')
-        group_dict = {g['group_id']: g for g in groups}
-        
-        def get_group_chain(group_id):
-            chain = []
-            while group_id:
-                grp = group_dict.get(group_id)
-                if not grp:
-                    break
-                chain.insert(0, grp['name'])
-                group_id = grp.get('parent_id')
-            return chain
-        
-        # Group consumption by date
-        date_summary = {}
-        total_consumption_quantity = 0
-        total_consumption_amount = 0.0
-        
-        # Initialize all dates in range
-        current_date = datetime.strptime(start_date, '%Y-%m-%d')
-        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-        while current_date <= end_dt:
-            date_summary[current_date.strftime('%Y-%m-%d')] = {}
-            current_date += timedelta(days=1)
-        
-        # Process ALL transactions by date - ensure we capture every single transaction
-        for tx in transactions:
-            op = tx.get("operation_type", "")
-            if op in ["AddDefectiveGoods", "PushToProduction"]:
-                tx_date = tx.get('date', '')
-                d = tx.get("details", {})
-                
-                if op == "PushToProduction":
-                    # Process each deduction in the transaction
-                    deductions = d.get("deductions", {})
-                    for item_id, qty in deductions.items():
-                        # Get group info for item
-                        group = "Unknown"
-                        subgroup = "Unknown"
-                        cost_per_unit = 0
-                        
-                        if item_id in stock_dict:
-                            stock_item = stock_dict[item_id]
-                            group_id = stock_item.get('group_id')
-                            chain = get_group_chain(group_id) if group_id else []
-                            group = chain[0] if len(chain) >= 1 else "Unknown"
-                            subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-                            cost_per_unit = float(stock_item.get('cost_per_unit', 0))
-                        
-                        # Ensure date exists
-                        if tx_date not in date_summary:
-                            date_summary[tx_date] = {}
-                        if group not in date_summary[tx_date]:
-                            date_summary[tx_date][group] = {}
-                        if subgroup not in date_summary[tx_date][group]:
-                            date_summary[tx_date][group][subgroup] = []
-                        
-                        # Add this specific transaction (don't aggregate, add each occurrence)
-                        date_summary[tx_date][group][subgroup].append({
-                            "item_id": item_id,
-                            "quantity": float(qty)
-                        })
-                        
-                        total_consumption_quantity += float(qty)
-                        total_consumption_amount += float(qty) * cost_per_unit
-                
-                elif op == "AddDefectiveGoods":
-                    # Process defective goods transaction
-                    item_id = d.get("item_id", "Unknown")
-                    qty = d.get("defective_added", 0)
-                    
-                    if qty > 0:  # Only process if there's actual quantity
-                        # Get group info for item
-                        group = "Unknown"
-                        subgroup = "Unknown"
-                        cost_per_unit = 0
-                        
-                        if item_id in stock_dict:
-                            stock_item = stock_dict[item_id]
-                            group_id = stock_item.get('group_id')
-                            chain = get_group_chain(group_id) if group_id else []
-                            group = chain[0] if len(chain) >= 1 else "Unknown"
-                            subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-                            cost_per_unit = float(stock_item.get('cost_per_unit', 0))
-                        
-                        # Ensure date exists
-                        if tx_date not in date_summary:
-                            date_summary[tx_date] = {}
-                        if group not in date_summary[tx_date]:
-                            date_summary[tx_date][group] = {}
-                        if subgroup not in date_summary[tx_date][group]:
-                            date_summary[tx_date][group][subgroup] = []
-                        
-                        # Add this specific transaction
-                        date_summary[tx_date][group][subgroup].append({
-                            "item_id": item_id,
-                            "quantity": float(qty)
-                        })
-                        
-                        total_consumption_quantity += float(qty)
-                        total_consumption_amount += float(qty) * cost_per_unit
-        
-        payload = {
-            "report_date": end_date,
-            "consumption_summary": date_summary,
-            "total_consumption_quantity": total_consumption_quantity,
-            "total_consumption_amount": total_consumption_amount
-        }
-        
-        return JsonResponse(payload)
-        
-    except Exception as e:
-        logger.error(f"Error in get_weekly_consumption_summary: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def get_monthly_consumption_summary(request):
-    """Get monthly consumption summary - converted from Lambda get_monthly_consumption_summary function"""
-    try:
-        body = json.loads(request.body)
+        if body is None:
+            body = json.loads(request.body)
         
         month_str = body.get("month")
-        if not month_str:
-            now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            month_str = now.strftime("%Y-%m")
-        
+        if not isinstance(month_str, str):
+            return JsonResponse({"error": "'month' parameter is required in format YYYY-MM"}, status=400)
+        month_str = month_str.strip()
         try:
             year, month = map(int, month_str.split("-"))
         except ValueError:
-            return JsonResponse({"error": "'month' must be in YYYY-MM format"}, status=400)
+            return JsonResponse({"error": "'month' must be in format YYYY-MM"}, status=400)
         
-        # Calculate month date range
-        import calendar
-        start_date = f"{year}-{month:02d}-01"
-        last_day = calendar.monthrange(year, month)[1]
-        end_date = f"{year}-{month:02d}-{last_day:02d}"
-
-        try:
-            # Get transactions for the month from DynamoDB - using correct table name
-            transactions = dynamodb_service.scan_table(
-                'stock_transactions',
-                FilterExpression='#date BETWEEN :start_date AND :end_date',
-                ExpressionAttributeNames={'#date': 'date'},
-                ExpressionAttributeValues={
-                    ':start_date': start_date,
-                    ':end_date': end_date
-                }
-            )
-            
-            # Extract consumption details (AddDefectiveGoods & PushToProduction)
-            consumption_details = []
-            for tx in transactions:
-                op = tx.get("operation_type", "")
-                if op in ["AddDefectiveGoods", "PushToProduction"]:
-                    d = tx.get("details", {})
-                    if op == "PushToProduction":
-                        for item_id, qty in d.get("deductions", {}).items():
-                            consumption_details.append({
-                                "item_id": item_id,
-                                "quantity_consumed": qty,
-                                "operation": op,
-                                "timestamp": tx.get("timestamp", "")
-                            })
-                    else:  # AddDefectiveGoods
-                        qty = d.get("defective_added", 0)
-                        consumption_details.append({
-                            "item_id": d.get("item_id", "Unknown"),
-                            "quantity_consumed": qty,
-                            "operation": op,
-                            "timestamp": tx.get("timestamp", "")
-                        })
-            
-            # Summarize consumption details by item_id
-            from collections import defaultdict
-            summary_map = defaultdict(Decimal)
-            for d in consumption_details:
-                summary_map[d['item_id']] += Decimal(str(d['quantity_consumed']))
-            
-            # Get stock items for cost calculation
-            stock_items = dynamodb_service.scan_table('STOCK')
-            stock_dict = {item['item_id']: item for item in stock_items}
-            
-            # Build nested consumption summary by group and subgroup
-            groups = dynamodb_service.scan_table('GROUPS')
-            group_dict = {g['group_id']: g for g in groups}
-            
-            def get_group_chain(group_id):
-                """Walk up the Groups table to build [parent, …, child] chain of names."""
-                chain = []
-                while group_id:
-                    grp = group_dict.get(group_id)
-                    if not grp:
-                        break
-                    chain.insert(0, grp['name'])
-                    group_id = grp.get('parent_id')
-                return chain
-            
-            nested_summary = {}
-            total_consumption_quantity = 0
-            total_consumption_amount = 0.0
-            
-            for item_id, qty in summary_map.items():
-                if item_id in stock_dict:
-                    stock_item = stock_dict[item_id]
-                    group_id = stock_item.get('group_id')
-                    
-                    # Build group chain
-                    chain = get_group_chain(group_id) if group_id else []
-                    group = chain[0] if len(chain) >= 1 else "Unknown"
-                    subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-                    
-                    # Calculate cost
-                    cost_per_unit = float(stock_item.get('cost_per_unit', 0))
-                    amount = float(qty) * cost_per_unit
-                    
-                    # Add to nested structure
-                    if group not in nested_summary:
-                        nested_summary[group] = {}
-                    if subgroup not in nested_summary[group]:
-                        nested_summary[group][subgroup] = []
-                    
-                    nested_summary[group][subgroup].append({
-                        "item_id": item_id,
-                        "total_quantity_consumed": float(qty)
-                    })
-                    
-                    total_consumption_quantity += float(qty)
-                    total_consumption_amount += amount
-            
-            payload = {
-                "month": month_str,
-                "start_date": start_date,
-                "end_date": end_date,
-                "consumption_summary": nested_summary,
-                "total_consumption_quantity": total_consumption_quantity,
-                "total_consumption_amount": total_consumption_amount
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching consumption data: {e}")
-            payload = {
-                "month": month_str,
-                "start_date": start_date,
-                "end_date": end_date,
-                "consumption_summary": {},
-                "total_consumption_quantity": 0,
-                "total_consumption_amount": 0.0
-            }
+        # 1) Determine first and last day of month - exact Lambda logic
+        first_day = date(year, month, 1)
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        start_date = first_day.strftime("%Y-%m-%d")
+        end_date = last_day.strftime("%Y-%m-%d")
         
-        return JsonResponse(payload)
+        # Parse into date objects for iteration
+        sd_dt = first_day
+        ed_dt = last_day
+        
+        # 2) Scan all transactions in [start_date..end_date] - exact Lambda filter
+        from boto3.dynamodb.conditions import Attr
+        date_filter = Attr('date').gte(start_date) & Attr('date').lte(end_date)
+        txns = dynamodb_service.scan_table('stock_transactions', FilterExpression=date_filter)
+        
+        # 3) Extract only consumption details - exact Lambda helper
+        consumption_details = extract_consumption_details(txns)
+        
+        # 4) Prepare flat enriched list - exact Lambda logic
+        flat = []
+        for d in consumption_details:
+            item_id = d['item_id']
+            qty = Decimal(str(d['quantity_consumed']))
+            date_key = d['timestamp'].split(' ')[0]
+            
+            stock_item = dynamodb_service.get_item('STOCK', {'item_id': item_id})
+            group_id = stock_item.get('group_id') if stock_item else None
+            
+            chain = get_group_chain(group_id) if group_id else []
+            group = chain[0] if len(chain) >= 1 else "Unknown"
+            subgroup = chain[1] if len(chain) >= 2 else "Unknown"
+            
+            flat.append({
+                "date": date_key,
+                "group": group,
+                "subgroup": subgroup,
+                "item_id": item_id,
+                "quantity": float(qty)
+            })
+        
+        # 5) Initialize nested[date] - exact Lambda logic
+        nested = {}
+        cur = sd_dt
+        while cur <= ed_dt:
+            nested[cur.strftime("%Y-%m-%d")] = {}
+            cur += timedelta(days=1)
+        
+        # 6) Populate nested[date][group][subgroup] - exact Lambda nesting
+        for e in flat:
+            dt = e['date']
+            g = e['group']
+            s = e['subgroup']
+            nested.setdefault(dt, {}).setdefault(g, {}).setdefault(s, []).append({
+                "item_id": e["item_id"],
+                "quantity": e["quantity"]
+            })
+        
+        # 7) Compute grand totals - exact Lambda calculation
+        total_qty = sum(Decimal(str(e['quantity'])) for e in flat)
+        total_amt = Decimal('0')
+        for e in flat:
+            stock_item = dynamodb_service.get_item('STOCK', {'item_id': e['item_id']})
+            if stock_item:
+                rate = Decimal(str(stock_item.get('cost_per_unit', 0)))
+                total_amt += rate * Decimal(str(e['quantity']))
+        
+        # 8) Assemble and return - exact Lambda payload
+        payload = {
+            "month": month_str,
+            "start_date": start_date,
+            "end_date": end_date,
+            "consumption_summary": nested,
+            "total_consumption_quantity": float(total_qty),
+            "total_consumption_amount": float(total_amt)
+        }
+        
+        return JsonResponse(payload, encoder=DecimalEncoder)
         
     except Exception as e:
-        logger.error(f"Error in get_monthly_consumption_summary: {e}")
+        logger.error(f"Error in get_monthly_consumption_summary: {e}", exc_info=True)
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def get_daily_inward(request):
-    """Get daily inward report - converted from Lambda get_daily_inward function"""
+    """Get daily inward report - direct URL access"""
     try:
-        body = json.loads(request.body)
+        from .inward_service import InwardService
         
+        body = json.loads(request.body) if request.body else {}
         report_date = body.get("report_date")
-        if report_date is None:
-            report_date = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
-        report_date = report_date.strip()
-
-        try:
-            # Get transactions for the date from DynamoDB - using correct table name
-            transactions = dynamodb_service.scan_table(
-                'stock_transactions',
-                FilterExpression='#date = :report_date',
-                ExpressionAttributeNames={'#date': 'date'},
-                ExpressionAttributeValues={':report_date': report_date}
-            )
-            
-            # Extract inward details (AddStockQuantity operations)
-            inward_details = []
-            for tx in transactions:
-                op = tx.get("operation_type", "")
-                if op == "AddStockQuantity":
-                    d = tx.get("details", {})
-                    inward_details.append({
-                        "item_id": d.get("item_id", "Unknown"),
-                        "quantity_added": float(d.get("quantity_added", 0)),
-                        "added_cost": float(d.get("added_cost", 0)),
-                        "timestamp": tx.get("timestamp", ""),
-                        "username": d.get("username", "")
-                    })
-            
-            # Get stock items for additional info
-            stock_items = dynamodb_service.scan_table('STOCK')
-            stock_dict = {item['item_id']: item for item in stock_items}
-            
-            # Build inward summary by group
-            groups = dynamodb_service.scan_table('GROUPS')
-            group_dict = {g['group_id']: g for g in groups}
-            
-            def get_group_chain(group_id):
-                chain = []
-                while group_id:
-                    grp = group_dict.get(group_id)
-                    if not grp:
-                        break
-                    chain.insert(0, grp['name'])
-                    group_id = grp.get('parent_id')
-                return chain
-            
-            inward_summary = {}
-            total_inward_quantity = 0
-            total_inward_amount = 0.0
-            
-            for detail in inward_details:
-                item_id = detail['item_id']
-                qty = detail['quantity_added']
-                cost = detail['added_cost']
-                
-                if item_id in stock_dict:
-                    stock_item = stock_dict[item_id]
-                    group_id = stock_item.get('group_id')
-                    
-                    # Build group chain
-                    chain = get_group_chain(group_id) if group_id else []
-                    group = chain[0] if len(chain) >= 1 else "Unknown"
-                    subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-                    
-                    # Add to nested structure
-                    if group not in inward_summary:
-                        inward_summary[group] = {}
-                    if subgroup not in inward_summary[group]:
-                        inward_summary[group][subgroup] = []
-                    
-                    inward_summary[group][subgroup].append({
-                        "item_id": item_id,
-                        "item_name": stock_item.get('name', ''),
-                        "quantity_added": qty,
-                        "added_cost": cost,
-                        "timestamp": detail['timestamp'],
-                        "username": detail['username']
-                    })
-                    
-                    total_inward_quantity += qty
-                    total_inward_amount += cost
-            
-            payload = {
-                "report_period": {"start_date": report_date, "end_date": report_date},
-                "report_date": report_date,
-                "inward_summary": inward_summary,
-                "total_inward_quantity": total_inward_quantity,
-                "total_inward_amount": total_inward_amount
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching inward data: {e}")
-            payload = {
-                "report_period": {"start_date": report_date, "end_date": report_date},
-                "report_date": report_date,
-                "inward_summary": {},
-                "total_inward_quantity": 0,
-                "total_inward_amount": 0.0
-            }
         
-        return JsonResponse(payload)
+        payload = InwardService.get_daily_inward(report_date)
+        return JsonResponse(payload, encoder=DecimalEncoder)
         
     except Exception as e:
-        logger.error(f"Error in get_daily_inward: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        logger.error(f"Error in get_daily_inward: {e}", exc_info=True)
+        return JsonResponse({"error": str(e)}, status=500)
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def get_weekly_inward(request):
-    """Get weekly inward report - converted from Lambda get_weekly_inward function"""
+    """Get weekly inward report - direct URL access"""
     try:
-        body = json.loads(request.body)
+        from .inward_service import InwardService
         
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        end_date = body.get("end_date", now.strftime("%Y-%m-%d")).strip()
-        start_date = body.get("start_date", (now - timedelta(days=7)).strftime("%Y-%m-%d")).strip()
-
-        try:
-            # Get transactions for the date range from DynamoDB - using correct table name
-            transactions = dynamodb_service.scan_table(
-                'stock_transactions',
-                FilterExpression='#date BETWEEN :start_date AND :end_date',
-                ExpressionAttributeNames={'#date': 'date'},
-                ExpressionAttributeValues={
-                    ':start_date': start_date,
-                    ':end_date': end_date
-                }
-            )
-            
-            # Extract inward details (AddStockQuantity operations)
-            inward_details = []
-            for tx in transactions:
-                op = tx.get("operation_type", "")
-                if op == "AddStockQuantity":
-                    d = tx.get("details", {})
-                    inward_details.append({
-                        "item_id": d.get("item_id", "Unknown"),
-                        "quantity_added": float(d.get("quantity_added", 0)),
-                        "added_cost": float(d.get("added_cost", 0)),
-                        "timestamp": tx.get("timestamp", ""),
-                        "username": d.get("username", ""),
-                        "date": tx.get("date", "")
-                    })
-            
-            # Get stock items for additional info
-            stock_items = dynamodb_service.scan_table('STOCK')
-            stock_dict = {item['item_id']: item for item in stock_items}
-            
-            # Build inward summary by group
-            groups = dynamodb_service.scan_table('GROUPS')
-            group_dict = {g['group_id']: g for g in groups}
-            
-            def get_group_chain(group_id):
-                chain = []
-                while group_id:
-                    grp = group_dict.get(group_id)
-                    if not grp:
-                        break
-                    chain.insert(0, grp['name'])
-                    group_id = grp.get('parent_id')
-                return chain
-            
-            inward_summary = {}
-            total_inward_quantity = 0
-            total_inward_amount = 0.0
-            
-            for detail in inward_details:
-                item_id = detail['item_id']
-                qty = detail['quantity_added']
-                cost = detail['added_cost']
-                
-                if item_id in stock_dict:
-                    stock_item = stock_dict[item_id]
-                    group_id = stock_item.get('group_id')
-                    
-                    # Build group chain
-                    chain = get_group_chain(group_id) if group_id else []
-                    group = chain[0] if len(chain) >= 1 else "Unknown"
-                    subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-                    
-                    # Add to nested structure
-                    if group not in inward_summary:
-                        inward_summary[group] = {}
-                    if subgroup not in inward_summary[group]:
-                        inward_summary[group][subgroup] = []
-                    
-                    inward_summary[group][subgroup].append({
-                        "item_id": item_id,
-                        "item_name": stock_item.get('name', ''),
-                        "quantity_added": qty,
-                        "added_cost": cost,
-                        "date": detail['date'],
-                        "timestamp": detail['timestamp'],
-                        "username": detail['username']
-                    })
-                    
-                    total_inward_quantity += qty
-                    total_inward_amount += cost
-            
-            payload = {
-                "report_period": {"start_date": start_date, "end_date": end_date},
-                "start_date": start_date,
-                "end_date": end_date,
-                "inward_summary": inward_summary,
-                "total_inward_quantity": total_inward_quantity,
-                "total_inward_amount": total_inward_amount
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching inward data: {e}")
-            payload = {
-                "report_period": {"start_date": start_date, "end_date": end_date},
-                "start_date": start_date,
-                "end_date": end_date,
-                "inward_summary": {},
-                "total_inward_quantity": 0,
-                "total_inward_amount": 0.0
-            }
+        body = json.loads(request.body) if request.body else {}
+        start_date = body.get("start_date")
+        end_date = body.get("end_date")
         
-        return JsonResponse(payload)
+        payload = InwardService.get_weekly_inward(start_date, end_date)
+        return JsonResponse(payload, encoder=DecimalEncoder)
         
     except Exception as e:
-        logger.error(f"Error in get_weekly_inward: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        logger.error(f"Error in get_weekly_inward: {e}", exc_info=True)
+        return JsonResponse({"error": str(e)}, status=500)
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def get_monthly_inward(request):
-    """Get monthly inward report - converted from Lambda get_monthly_inward function"""
+    """Get monthly inward report - direct URL access"""
     try:
-        body = json.loads(request.body)
+        from .inward_service import InwardService
+        import calendar
         
+        body = json.loads(request.body) if request.body else {}
         month_str = body.get("month")
+        
         if not month_str:
             now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             month_str = now.strftime("%Y-%m")
@@ -1485,120 +504,19 @@ def get_monthly_inward(request):
             return JsonResponse({"error": "'month' must be in YYYY-MM format"}, status=400)
         
         # Calculate month date range
-        import calendar
         start_date = f"{year}-{month:02d}-01"
         last_day = calendar.monthrange(year, month)[1]
         end_date = f"{year}-{month:02d}-{last_day:02d}"
-
-        try:
-            # Get transactions for the month from DynamoDB - using correct table name
-            transactions = dynamodb_service.scan_table(
-                'stock_transactions',
-                FilterExpression='#date BETWEEN :start_date AND :end_date',
-                ExpressionAttributeNames={'#date': 'date'},
-                ExpressionAttributeValues={
-                    ':start_date': start_date,
-                    ':end_date': end_date
-                }
-            )
-            
-            # Extract inward details (AddStockQuantity operations)
-            inward_details = []
-            for tx in transactions:
-                op = tx.get("operation_type", "")
-                if op == "AddStockQuantity":
-                    d = tx.get("details", {})
-                    inward_details.append({
-                        "item_id": d.get("item_id", "Unknown"),
-                        "quantity_added": float(d.get("quantity_added", 0)),
-                        "added_cost": float(d.get("added_cost", 0)),
-                        "timestamp": tx.get("timestamp", ""),
-                        "username": d.get("username", ""),
-                        "date": tx.get("date", "")
-                    })
-            
-            # Get stock items for additional info
-            stock_items = dynamodb_service.scan_table('STOCK')
-            stock_dict = {item['item_id']: item for item in stock_items}
-            
-            # Build inward summary by group
-            groups = dynamodb_service.scan_table('GROUPS')
-            group_dict = {g['group_id']: g for g in groups}
-            
-            def get_group_chain(group_id):
-                chain = []
-                while group_id:
-                    grp = group_dict.get(group_id)
-                    if not grp:
-                        break
-                    chain.insert(0, grp['name'])
-                    group_id = grp.get('parent_id')
-                return chain
-            
-            inward_summary = {}
-            total_inward_quantity = 0
-            total_inward_amount = 0.0
-            
-            for detail in inward_details:
-                item_id = detail['item_id']
-                qty = detail['quantity_added']
-                cost = detail['added_cost']
-                
-                if item_id in stock_dict:
-                    stock_item = stock_dict[item_id]
-                    group_id = stock_item.get('group_id')
-                    
-                    # Build group chain
-                    chain = get_group_chain(group_id) if group_id else []
-                    group = chain[0] if len(chain) >= 1 else "Unknown"
-                    subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-                    
-                    # Add to nested structure
-                    if group not in inward_summary:
-                        inward_summary[group] = {}
-                    if subgroup not in inward_summary[group]:
-                        inward_summary[group][subgroup] = []
-                    
-                    inward_summary[group][subgroup].append({
-                        "item_id": item_id,
-                        "item_name": stock_item.get('name', ''),
-                        "quantity_added": qty,
-                        "added_cost": cost,
-                        "date": detail['date'],
-                        "timestamp": detail['timestamp'],
-                        "username": detail['username']
-                    })
-                    
-                    total_inward_quantity += qty
-                    total_inward_amount += cost
-            
-            payload = {
-                "report_period": {"start_date": start_date, "end_date": end_date},
-                "month": month_str,
-                "start_date": start_date,
-                "end_date": end_date,
-                "inward_summary": inward_summary,
-                "total_inward_quantity": total_inward_quantity,
-                "total_inward_amount": total_inward_amount
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching inward data: {e}")
-            payload = {
-                "report_period": {"start_date": start_date, "end_date": end_date},
-                "month": month_str,
-                "start_date": start_date,
-                "end_date": end_date,
-                "inward_summary": {},
-                "total_inward_quantity": 0,
-                "total_inward_amount": 0.0
-            }
         
-        return JsonResponse(payload)
+        # Use weekly inward logic for monthly range
+        payload = InwardService.get_weekly_inward(start_date, end_date)
+        payload["month"] = month_str
+        
+        return JsonResponse(payload, encoder=DecimalEncoder)
         
     except Exception as e:
-        logger.error(f"Error in get_monthly_inward: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        logger.error(f"Error in get_monthly_inward: {e}", exc_info=True)
+        return JsonResponse({"error": str(e)}, status=500)
 
 @csrf_exempt
 @require_http_methods(["POST"])
@@ -1715,6 +633,251 @@ def get_today_logs(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def get_daily_push_to_production(request):
+    """Get daily push to production report"""
+    try:
+        from backend.dynamodb_service import dynamodb_service
+        from collections import defaultdict
+        
+        body = json.loads(request.body) if request.body else {}
+        date_str = body.get('date')
+        
+        if not date_str:
+            return JsonResponse({"error": "'date' is required (format: YYYY-MM-DD)"}, status=400)
+            
+        # Get all push records
+        push_records = dynamodb_service.scan_table('push_to_production')
+        
+        # Filter by date
+        daily_items = [
+            item for item in push_records
+            if item.get('timestamp', '').startswith(date_str)
+        ]
+        
+        # Group by product for summary
+        product_summary = defaultdict(lambda: {"product_name": "", "total_quantity": 0})
+        
+        for item in daily_items:
+            product_id = item.get('product_id', 'Unknown')
+            product_name = item.get('product_name', 'Unknown')
+            quantity = float(item.get('quantity_produced', 0))
+            
+            product_summary[product_id]["product_name"] = product_name
+            product_summary[product_id]["total_quantity"] += quantity
+            
+        # Convert to list
+        summary_list = [
+            {
+                "product_id": product_id,
+                "product_name": data["product_name"],
+                "total_quantity": data["total_quantity"]
+            }
+            for product_id, data in product_summary.items()
+        ]
+        
+        return JsonResponse({
+            "summary": summary_list,
+            "items": daily_items
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_daily_push_to_production: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def get_weekly_push_to_production(request):
+    """Get weekly push to production report"""
+    try:
+        from backend.dynamodb_service import dynamodb_service
+        from collections import defaultdict
+        from datetime import datetime
+        
+        body = json.loads(request.body) if request.body else {}
+        from_str = body.get('from_date')
+        to_str = body.get('to_date')
+        
+        if not from_str or not to_str:
+            return JsonResponse({"error": "'from_date' and 'to_date' are required (format: YYYY-MM-DD)"}, status=400)
+            
+        from_date = datetime.strptime(from_str, "%Y-%m-%d").date()
+        to_date = datetime.strptime(to_str, "%Y-%m-%d").date()
+        
+        # Get all push records
+        push_records = dynamodb_service.scan_table('push_to_production')
+        
+        # Filter by date range
+        weekly_items = []
+        for item in push_records:
+            timestamp = item.get('timestamp')
+            if timestamp:
+                dt = datetime.strptime(timestamp[:10], "%Y-%m-%d").date()
+                if from_date <= dt <= to_date:
+                    weekly_items.append(item)
+                    
+        # Group by product for summary
+        product_summary = defaultdict(lambda: {"product_name": "", "total_quantity": 0})
+        
+        for item in weekly_items:
+            product_id = item.get('product_id', 'Unknown')
+            product_name = item.get('product_name', 'Unknown')
+            quantity = float(item.get('quantity_produced', 0))
+            
+            product_summary[product_id]["product_name"] = product_name
+            product_summary[product_id]["total_quantity"] += quantity
+            
+        # Convert to list
+        summary_list = [
+            {
+                "product_id": product_id,
+                "product_name": data["product_name"],
+                "total_quantity": data["total_quantity"]
+            }
+            for product_id, data in product_summary.items()
+        ]
+        
+        return JsonResponse({
+            "summary": summary_list,
+            "items": weekly_items
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_weekly_push_to_production: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def get_monthly_push_to_production(request):
+    """Get monthly push to production report"""
+    try:
+        from backend.dynamodb_service import dynamodb_service
+        from collections import defaultdict
+        from datetime import datetime
+        
+        body = json.loads(request.body) if request.body else {}
+        from_str = body.get('from_date')
+        to_str = body.get('to_date')
+        
+        if not from_str or not to_str:
+            return JsonResponse({"error": "'from_date' and 'to_date' are required (format: YYYY-MM-DD)"}, status=400)
+            
+        from_date = datetime.strptime(from_str, "%Y-%m-%d").date()
+        to_date = datetime.strptime(to_str, "%Y-%m-%d").date()
+        
+        # Get all push records
+        push_records = dynamodb_service.scan_table('push_to_production')
+        
+        # Filter by date range
+        monthly_items = []
+        for item in push_records:
+            timestamp = item.get('timestamp')
+            if timestamp:
+                dt = datetime.strptime(timestamp[:10], "%Y-%m-%d").date()
+                if from_date <= dt <= to_date:
+                    monthly_items.append(item)
+                    
+        # Group by product for summary
+        product_summary = defaultdict(lambda: {"product_name": "", "total_quantity": 0})
+        
+        for item in monthly_items:
+            product_id = item.get('product_id', 'Unknown')
+            product_name = item.get('product_name', 'Unknown')
+            quantity = float(item.get('quantity_produced', 0))
+            
+            product_summary[product_id]["product_name"] = product_name
+            product_summary[product_id]["total_quantity"] += quantity
+            
+        # Convert to list
+        summary_list = [
+            {
+                "product_id": product_id,
+                "product_name": data["product_name"],
+                "total_quantity": data["total_quantity"]
+            }
+            for product_id, data in product_summary.items()
+        ]
+        
+        return JsonResponse({
+            "summary": summary_list,
+            "items": monthly_items
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_monthly_push_to_production: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def get_monthly_production_summary(request):
+    """Get monthly production summary"""
+    try:
+        from backend.dynamodb_service import dynamodb_service
+        from collections import defaultdict
+        from datetime import datetime
+        import calendar
+        
+        body = json.loads(request.body) if request.body else {}
+        month_str = body.get('month')
+        
+        if not month_str:
+            now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            month_str = now.strftime("%Y-%m")
+        
+        try:
+            year, month = map(int, month_str.split("-"))
+        except ValueError:
+            return JsonResponse({"error": "'month' must be in YYYY-MM format"}, status=400)
+        
+        # Calculate month date range
+        start_date = f"{year}-{month:02d}-01"
+        last_day = calendar.monthrange(year, month)[1]
+        end_date = f"{year}-{month:02d}-{last_day:02d}"
+        
+        # Get all push records
+        push_records = dynamodb_service.scan_table('push_to_production')
+        
+        # Filter by month
+        monthly_items = []
+        for item in push_records:
+            timestamp = item.get('timestamp')
+            if timestamp and start_date <= timestamp[:10] <= end_date:
+                monthly_items.append(item)
+                
+        # Group by product for summary
+        product_summary = defaultdict(lambda: {"product_name": "", "total_quantity": 0})
+        
+        for item in monthly_items:
+            product_id = item.get('product_id', 'Unknown')
+            product_name = item.get('product_name', 'Unknown')
+            quantity = float(item.get('quantity_produced', 0))
+            
+            product_summary[product_id]["product_name"] = product_name
+            product_summary[product_id]["total_quantity"] += quantity
+            
+        # Convert to list
+        summary_list = [
+            {
+                "product_id": product_id,
+                "product_name": data["product_name"],
+                "total_quantity": data["total_quantity"]
+            }
+            for product_id, data in product_summary.items()
+        ]
+        
+        return JsonResponse({
+            "month": month_str,
+            "start_date": start_date,
+            "end_date": end_date,
+            "summary": summary_list,
+            "items": monthly_items
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_monthly_production_summary: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def get_item_history(request):
     """Get item history - converted from Lambda get_item_history function"""
     try:
@@ -1800,7 +963,7 @@ def get_item_history(request):
                 item_events.append(event)
         
         # Get production records that consumed this item
-        production_records = dynamodb_service.scan_table('PUSH_TO_PRODUCTION')
+        production_records = dynamodb_service.scan_table('push_to_production')
         for record in production_records:
             components = record.get('components', [])
             for component in components:
@@ -1840,4 +1003,272 @@ def get_item_history(request):
         
     except Exception as e:
         logger.error(f"Error in get_item_history: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def get_monthly_inward_grid(request, body=None):
+    """Get monthly inward grid - returns all materials like outward grid"""
+    try:
+        if body is None:
+            body = json.loads(request.body)
+        
+        month_str = body.get("month")
+        if not isinstance(month_str, str):
+            return JsonResponse({"error": "'month' parameter is required in format YYYY-MM"}, status=400)
+        month_str = month_str.strip()
+        try:
+            year, month = map(int, month_str.split("-"))
+        except ValueError:
+            return JsonResponse({"error": "'month' must be in format YYYY-MM"}, status=400)
+        
+        # 1) Determine first and last day of month
+        first_day = date(year, month, 1)
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        start_date_str = first_day.strftime("%Y-%m-%d")
+        end_date_str = last_day.strftime("%Y-%m-%d")
+        
+        # 2) Fetch ALL Stock items first
+        live_stock_map = {}
+        stock_items = dynamodb_service.scan_table('STOCK')
+        for item in stock_items:
+            live_stock_map[item['item_id']] = {
+                "current_qty": float(item.get('quantity', 0)),
+                "group_id": item.get('group_id'),
+                "name": item.get('name')
+            }
+        
+        # 3) Get AddStockQuantity transactions for the month
+        from boto3.dynamodb.conditions import Attr
+        transactions = dynamodb_service.scan_table(
+            'stock_transactions',
+            FilterExpression=Attr('operation_type').eq('AddStockQuantity') & 
+                           Attr('date').between(start_date_str, end_date_str)
+        )
+        
+        # 4) Process inward transactions
+        inward_data = defaultdict(lambda: {
+            'inward_days': {},
+            'total_inward': 0.0,
+            'total_in_period_to_now': 0.0
+        })
+        
+        # Get all AddStockQuantity transactions from month start to calculate opening balance
+        all_inward_txns = dynamodb_service.scan_table(
+            'stock_transactions',
+            FilterExpression=Attr('operation_type').eq('AddStockQuantity') & 
+                           Attr('date').gte(start_date_str)
+        )
+        
+        # Process all inward transactions for opening balance calculation
+        for txn in all_inward_txns:
+            details = txn.get('details', {})
+            item_id = details.get('item_id')
+            if not item_id:
+                continue
+            quantity_added = float(details.get('quantity_added', 0))
+            inward_data[item_id]['total_in_period_to_now'] += quantity_added
+        
+        # Process month-specific transactions for inward_days
+        for txn in transactions:
+            details = txn.get('details', {})
+            item_id = details.get('item_id')
+            if not item_id:
+                continue
+                
+            # Extract day from date
+            txn_date = txn.get('date', '')
+            day = int(txn_date.split('-')[2]) if txn_date else 0
+            
+            quantity_added = float(details.get('quantity_added', 0))
+            
+            # Update inward data
+            inward_data[item_id]['inward_days'][str(day)] = inward_data[item_id]['inward_days'].get(str(day), 0.0) + quantity_added
+            inward_data[item_id]['total_inward'] += quantity_added
+        
+        # 5) Build response for ALL materials
+        groups_data = dynamodb_service.scan_table('GROUPS')
+        group_map = {g['group_id']: g.get('name', 'Unknown') for g in groups_data}
+        
+        final_output = defaultdict(list)
+        monthly_total = 0.0
+        
+        for item_id, info in live_stock_map.items():
+            data = inward_data[item_id]
+            
+            # Calculate opening balance: current_qty - total_inward_since_month_start
+            opening_balance = info['current_qty'] - data['total_in_period_to_now']
+            
+            monthly_total += data['total_inward']
+            
+            item_entry = {
+                "item_id": item_id,
+                "item_name": info['name'],
+                "opening_balance": round(opening_balance, 2),
+                "inward_days": dict(data['inward_days']),
+                "total_inward": round(data['total_inward'], 2)
+            }
+            
+            grp_name = group_map.get(info['group_id'], "Ungrouped")
+            final_output[grp_name].append(item_entry)
+        
+        # 6) Build payload
+        payload = {
+            "month": month_str,
+            "type": "INWARD",
+            "grid_data": dict(final_output),
+            "monthly_total": monthly_total
+        }
+        
+        return JsonResponse(payload, encoder=DecimalEncoder)
+        
+    except Exception as e:
+        logger.error(f"Error in get_monthly_inward_grid: {e}", exc_info=True)
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def get_monthly_outward_grid(request, body=None):
+    """Get monthly outward grid - optimized with GSI queries"""
+    try:
+        # Ensure index exists
+        ensure_transactions_index()
+        
+        if body is None:
+            body = json.loads(request.body)
+        
+        month_str = body.get("month")
+        if not isinstance(month_str, str):
+            return JsonResponse({"error": "'month' parameter is required in format YYYY-MM"}, status=400)
+        month_str = month_str.strip()
+        try:
+            year, month = map(int, month_str.split("-"))
+        except ValueError:
+            return JsonResponse({"error": "'month' must be in format YYYY-MM"}, status=400)
+        
+        # 1) Determine first and last day of month
+        first_day = date(year, month, 1)
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        start_date_str = first_day.strftime("%Y-%m-%d")
+        end_date_str = last_day.strftime("%Y-%m-%d")
+        
+        # 2) Fetch LIVE Stock
+        live_stock_map = {}
+        stock_items = dynamodb_service.scan_table('STOCK')
+        for item in stock_items:
+            live_stock_map[item['item_id']] = {
+                "current_qty": float(item.get('quantity', 0)),
+                "group_id": item.get('group_id'),
+                "name": item.get('name')
+            }
+        
+        # 3) OPTIMIZED FETCH: Query specific operations via Index
+        import boto3
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-2')
+        tx_tbl = dynamodb.Table('stock_transactions')
+        txns = []
+        
+        # List of operations we need for the O/B Math
+        required_ops = ["AddStockQuantity", "PushToProduction", "AddDefectiveGoods"]
+        
+        for op in required_ops:
+            try:
+                # Query GSI: operation_type = op AND date >= start_date
+                query_params = {
+                    'IndexName': 'OpTypeDateIndex',
+                    'KeyConditionExpression': Key('operation_type').eq(op) & Key('date').gte(start_date_str)
+                }
+                
+                resp = tx_tbl.query(**query_params)
+                txns.extend(resp.get("Items", []))
+                
+                while 'LastEvaluatedKey' in resp:
+                    query_params['ExclusiveStartKey'] = resp['LastEvaluatedKey']
+                    resp = tx_tbl.query(**query_params)
+                    txns.extend(resp.get("Items", []))
+            except Exception as query_error:
+                logger.warning(f"GSI query failed for {op}, falling back to scan: {query_error}")
+                # Fallback to scan if GSI not ready
+                fallback_txns = dynamodb_service.scan_table(
+                    'stock_transactions',
+                    FilterExpression=Attr('operation_type').eq(op) & Attr('date').gte(start_date_str)
+                )
+                txns.extend(fallback_txns)
+        
+        # 4) Process Data
+        report_data = defaultdict(lambda: {
+            "out_days": defaultdict(float),
+            "total_in_period_to_now": 0.0,
+            "total_out_period_to_now": 0.0,
+            "total_out_month": 0.0
+        })
+        
+        for tx in txns:
+            tx_date_str = tx.get('date')
+            try:
+                day_num = datetime.strptime(tx_date_str, "%Y-%m-%d").date().day
+            except:
+                continue
+            
+            is_in_view_month = (start_date_str <= tx_date_str <= end_date_str)
+            op_type = tx.get('operation_type')
+            details = tx.get('details', {})
+            
+            if op_type == "AddStockQuantity":
+                item_id = details.get('item_id')
+                report_data[item_id]["total_in_period_to_now"] += float(details.get('quantity_added', 0))
+            
+            elif op_type in ["PushToProduction", "AddDefectiveGoods"]:
+                if op_type == "PushToProduction":
+                    deductions = details.get('deductions', {})
+                    for item_id, qty_dec in deductions.items():
+                        qty = float(qty_dec)
+                        report_data[item_id]["total_out_period_to_now"] += qty
+                        if is_in_view_month:
+                            report_data[item_id]["out_days"][str(day_num)] += qty
+                            report_data[item_id]["total_out_month"] += qty
+                else:
+                    item_id = details.get('item_id')
+                    qty = float(details.get('defective_added', 0))
+                    report_data[item_id]["total_out_period_to_now"] += qty
+                    if is_in_view_month:
+                        report_data[item_id]["out_days"][str(day_num)] += qty
+                        report_data[item_id]["total_out_month"] += qty
+        
+        # 5) Build Response with groups
+        groups_data = dynamodb_service.scan_table('GROUPS')
+        group_map = {g['group_id']: g.get('name', 'Unknown') for g in groups_data}
+        
+        final_output = defaultdict(list)
+        monthly_total = 0.0
+        
+        for item_id, info in live_stock_map.items():
+            data = report_data[item_id]
+            # O/B Formula
+            opening_balance = info['current_qty'] - data["total_in_period_to_now"] + data["total_out_period_to_now"]
+            
+            monthly_total += data["total_out_month"]
+            
+            item_entry = {
+                "item_id": item_id,
+                "item_name": info['name'],
+                "opening_balance": round(opening_balance, 2),
+                "outward_days": dict(data["out_days"]),
+                "total_outward": round(data["total_out_month"], 2)
+            }
+            grp_name = group_map.get(info['group_id'], "Ungrouped")
+            final_output[grp_name].append(item_entry)
+        
+        # 6) Build payload
+        payload = {
+            "month": month_str,
+            "type": "OUTWARD",
+            "grid_data": dict(final_output),
+            "monthly_total": monthly_total
+        }
+        
+        return JsonResponse(payload, encoder=DecimalEncoder)
+        
+    except Exception as e:
+        logger.error(f"Error in get_monthly_outward_grid: {e}", exc_info=True)
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)

@@ -4,6 +4,7 @@ URL configuration for backend project.
 from django.urls import path, include
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from .csrf_views import get_csrf_token
 import json
 
 @csrf_exempt
@@ -82,9 +83,27 @@ def lambda_handler_view(request):
                 request._body = json.dumps(body).encode('utf-8')
                 return getattr(production_views, func_name)(request)
             
-        elif operation in ['GetDailyReport', 'GetWeeklyReport', 'GetMonthlyReport', 'GetAllStockTransactions', 'GetDailyConsumptionSummary', 'GetWeeklyConsumptionSummary', 'GetMonthlyConsumptionSummary', 'GetDailyInward', 'GetWeeklyInward', 'GetMonthlyInward', 'GetTodayLogs', 'GetItemHistory', 'GetMonthlyProductionSummary']:
+        elif operation in ['GetDailyReport', 'GetWeeklyReport', 'GetMonthlyReport', 'GetAllStockTransactions', 'GetDailyConsumptionSummary', 'GetWeeklyConsumptionSummary', 'GetMonthlyConsumptionSummary', 'GetDailyInward', 'GetWeeklyInward', 'GetMonthlyInward', 'GetTodayLogs', 'GetItemHistory', 'GetMonthlyProductionSummary', 'GetMonthlyInwardGrid', 'GetMonthlyOutwardGrid']:
             from reports import views as reports_views
-            return getattr(reports_views, operation.lower().replace('get', 'get_'))(request, body)
+            operation_map = {
+                'GetDailyConsumptionSummary': 'get_daily_consumption_summary',
+                'GetWeeklyConsumptionSummary': 'get_weekly_consumption_summary',
+                'GetMonthlyConsumptionSummary': 'get_monthly_consumption_summary',
+                'GetDailyInward': 'get_daily_inward',
+                'GetWeeklyInward': 'get_weekly_inward',
+                'GetMonthlyInward': 'get_monthly_inward',
+                'GetMonthlyInwardGrid': 'get_monthly_inward_grid',
+                'GetMonthlyOutwardGrid': 'get_monthly_outward_grid',
+                'GetAllStockTransactions': 'get_all_stock_transactions',
+                'GetTodayLogs': 'get_today_logs',
+                'GetItemHistory': 'get_item_history',
+                'GetMonthlyProductionSummary': 'get_monthly_production_summary'
+            }
+            func_name = operation_map.get(operation)
+            if func_name:
+                return getattr(reports_views, func_name)(request, body)
+            else:
+                return getattr(reports_views, operation.lower().replace('get', 'get_'))(request, body)
             
         elif operation in ['CreateCastingProduct', 'MoveToProduction', 'DeleteCastingProduct']:
             from casting import views as casting_views
@@ -101,6 +120,20 @@ def lambda_handler_view(request):
             from stock import views as stock_views
             return stock_views.delete_transaction_data(request)
             
+        elif operation in ['CreateFreightNote', 'GetFreightNote', 'ListFreightNotes', 'UpdateFreightNote', 'DeleteFreightNote']:
+            from freight import views as freight_views
+            operation_map = {
+                'CreateFreightNote': 'create_freight_note',
+                'GetFreightNote': 'get_freight_note',
+                'ListFreightNotes': 'list_freight_notes',
+                'UpdateFreightNote': 'update_freight_note',
+                'DeleteFreightNote': 'delete_freight_note'
+            }
+            func_name = operation_map.get(operation)
+            if func_name:
+                request._body = json.dumps(body).encode('utf-8')
+                return getattr(freight_views, func_name)(request)
+            
         else:
             return JsonResponse({"error": "Invalid operation"}, status=400)
         
@@ -110,6 +143,7 @@ def lambda_handler_view(request):
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 urlpatterns = [
+    path('api/csrf-token/', get_csrf_token, name='csrf_token'),
     path('api/lambda/', lambda_handler_view, name='lambda_handler'),
     path('api/users/', include('users.urls')),
     path('api/stock/', include('stock.urls')),
@@ -117,4 +151,5 @@ urlpatterns = [
     path('api/casting/', include('casting.urls')),
     path('api/reports/', include('reports.urls')),
     path('api/grn/', include('grn.urls')),
+    path('api/freight/', include('freight.urls')),
 ]

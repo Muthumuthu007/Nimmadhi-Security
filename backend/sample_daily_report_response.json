@@ -1,0 +1,56 @@
+{
+  "report_date": "2024-01-15",
+  "stock_summary": {
+    "Raw Materials": {
+      "Steel": [
+        {
+          "item_id": "steel_rod_10mm",
+          "total_quantity_consumed": 50.0,
+          "total_quantity_added": 100.0,
+          "total_added_cost": 5000.0,
+          "suppliers": ["ABC Steel Co", "XYZ Metals"]
+        },
+        {
+          "item_id": "steel_sheet_2mm",
+          "total_quantity_consumed": 25.0,
+          "total_quantity_added": 75.0,
+          "total_added_cost": 3750.0,
+          "suppliers": ["ABC Steel Co"]
+        }
+      ],
+      "Aluminum": [
+        {
+          "item_id": "aluminum_bar_5mm",
+          "total_quantity_consumed": 0.0,
+          "total_quantity_added": 200.0,
+          "total_added_cost": 8000.0,
+          "suppliers": ["Metal Suppliers Ltd"]
+        }
+      ]
+    },
+    "Components": {
+      "Fasteners": [
+        {
+          "item_id": "bolt_m8_50mm",
+          "total_quantity_consumed": 150.0,
+          "total_quantity_added": 500.0,
+          "total_added_cost": 750.0,
+          "suppliers": ["Fastener World", "Bolt Supply Co"]
+        }
+      ],
+      "Electronics": [
+        {
+          "item_id": "resistor_100ohm",
+          "total_quantity_consumed": 25.0,
+          "total_quantity_added": 0.0,
+          "total_added_cost": 0.0,
+          "suppliers": []
+        }
+      ]
+    }
+  },
+  "total_consumption_quantity": 250.0,
+  "total_consumption_amount": 1250.0,
+  "total_inward_quantity": 875.0,
+  "total_inward_amount": 17500.0
+}

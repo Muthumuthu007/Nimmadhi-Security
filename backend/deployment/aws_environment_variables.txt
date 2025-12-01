@@ -1,0 +1,35 @@
+# AWS Elastic Beanstalk Environment Variables
+# Set these in EB Console or via EB CLI
+
+# Django Configuration
+DJANGO_SECRET_KEY=your-very-secure-secret-key-change-this
+JWT_SECRET=your-jwt-secret-key-change-this
+DEBUG=False
+DJANGO_SETTINGS_MODULE=backend.settings
+
+# Allowed Hosts (update with your EB URL)
+ALLOWED_HOSTS=production-api.us-east-1.elasticbeanstalk.com,your-domain.com
+CSRF_TRUSTED_ORIGINS=https://production-api.us-east-1.elasticbeanstalk.com,https://your-domain.com
+
+# AWS Configuration for DynamoDB
+AWS_ACCESS_KEY_ID=your-aws-access-key-for-dynamodb
+AWS_SECRET_ACCESS_KEY=your-aws-secret-key-for-dynamodb
+AWS_REGION=ap-south-1
+
+# Security Settings
+RATE_LIMIT_ENABLE=True
+RATE_LIMIT_PER_MINUTE=60
+JWT_EXPIRATION_HOURS=6
+
+# Python Path
+PYTHONPATH=/var/app/current:$PYTHONPATH
+
+# Commands to set via EB CLI:
+# eb setenv DJANGO_SECRET_KEY="your-secret"
+# eb setenv JWT_SECRET="your-jwt-secret"
+# eb setenv DEBUG=False
+# eb setenv ALLOWED_HOSTS="your-eb-url.elasticbeanstalk.com"
+# eb setenv CSRF_TRUSTED_ORIGINS="https://your-eb-url.elasticbeanstalk.com"
+# eb setenv AWS_ACCESS_KEY_ID="your-key"
+# eb setenv AWS_SECRET_ACCESS_KEY="your-secret"
+# eb setenv AWS_REGION="ap-south-1"

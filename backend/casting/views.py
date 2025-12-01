@@ -4,36 +4,55 @@ import logging
 from decimal import Decimal
 from datetime import datetime
 from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
+from django.views.decorators.csrf import csrf_protect
 from backend.dynamodb_service import dynamodb_service
+from backend.validators import InputValidator, validate_request_data
+from backend.error_handlers import SecureErrorHandler
+from backend.secure_db_service import SecureDatabaseService
+from backend.security_monitor import SecurityMonitor
+from users.decorators import jwt_required, admin_required
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-@csrf_exempt
+@csrf_protect
 @require_http_methods(["POST"])
+@jwt_required
+@validate_request_data(required_fields=['product_name', 'stock_needed', 'username', 'labour_cost', 'transport_cost', 'other_cost', 'wastage_percent'])
 def create_casting_product(request):
     try:
-        body = json.loads(request.body)
+        body = request.validated_data
         
-        required = ['product_name', 'stock_needed', 'username', 'labour_cost', 'transport_cost', 'other_cost', 'wastage_percent']
-        for field in required:
-            if field not in body:
-                return JsonResponse({"error": f"'{field}' is required"}, status=400)
-
+        # Validate and sanitize inputs
+        product_name = InputValidator.sanitize_string(body['product_name'], 100)
+        if not product_name:
+            return SecureErrorHandler.validation_error("Invalid product name")
+        
+        username = InputValidator.sanitize_string(body['username'], 50)
+        if not InputValidator.validate_username(username):
+            return SecureErrorHandler.validation_error("Invalid username format")
+        
+        # Validate numeric inputs
+        if not InputValidator.validate_decimal(body['labour_cost'], 0, 999999):
+            return SecureErrorHandler.validation_error("Invalid labour cost")
+        if not InputValidator.validate_decimal(body['transport_cost'], 0, 999999):
+            return SecureErrorHandler.validation_error("Invalid transport cost")
+        if not InputValidator.validate_decimal(body['other_cost'], 0, 999999):
+            return SecureErrorHandler.validation_error("Invalid other cost")
+        if not InputValidator.validate_decimal(body['wastage_percent'], 0, 100):
+            return SecureErrorHandler.validation_error("Invalid wastage percentage")
+        
         product_id = str(uuid.uuid4())
-        product_name = body['product_name']
         stock_needed = body['stock_needed']
-        username = body['username']
         labour_cost = Decimal(str(body['labour_cost']))
         transport_cost = Decimal(str(body['transport_cost']))
         other_cost = Decimal(str(body['other_cost']))
         wastage_percent = Decimal(str(body['wastage_percent']))
         
-        # Check if product already exists
-        existing_products = dynamodb_service.scan_table('CASTING_PRODUCTS')
-        for product in existing_products:
+        # Check if product already exists for this user
+        user_products = SecureDatabaseService.get_user_products(username, 'CASTING_PRODUCTS')
+        for product in user_products:
             if product.get('product_name') == product_name:
                 return JsonResponse({"error": "Product already exists in casting"}, status=400)
 
@@ -67,10 +86,17 @@ def create_casting_product(request):
             'created_at': datetime.now().isoformat()
         }
         
-        logger.info(f"Attempting to save casting product: {casting_product}")
+        # Record security event
+        SecurityMonitor.record_security_event(
+            'product_created', 
+            user=username, 
+            ip_address=request.META.get('REMOTE_ADDR'),
+            details={'product_id': product_id}
+        )
+        
+        logger.info(f"Creating casting product for user: {username}")
         result = dynamodb_service.put_item('CASTING_PRODUCTS', casting_product)
-        logger.info(f"DynamoDB put_item result: {result}")
-        logger.info(f"Casting product created: {product_id}")
+        logger.info(f"Casting product created successfully: {product_id}")
         
         return JsonResponse({
             "message": "Casting product created successfully",
@@ -79,23 +105,32 @@ def create_casting_product(request):
         })
         
     except Exception as e:
-        logger.error(f"Error in create_casting_product: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        return SecureErrorHandler.handle_error(e, "product creation")
 
-@csrf_exempt
+@csrf_protect
 @require_http_methods(["POST"])
+@jwt_required
+@validate_request_data(required_fields=['product_id'])
 def move_to_production(request):
     try:
-        body = json.loads(request.body)
-        
-        if 'product_id' not in body:
-            return JsonResponse({"error": "'product_id' is required"}, status=400)
-
+        body = request.validated_data
         product_id = body['product_id']
         
-        # Get product from casting table
-        casting_product = dynamodb_service.get_item('CASTING_PRODUCTS', {'product_id': product_id})
+        # Validate product_id format
+        if not InputValidator.validate_uuid(product_id):
+            return SecureErrorHandler.validation_error("Invalid product ID format")
+        
+        # Verify user owns the product
+        casting_product = SecureDatabaseService.check_product_ownership(
+            product_id, 
+            request.user_info.get('username'), 
+            'CASTING_PRODUCTS'
+        )
         if not casting_product:
+            SecurityMonitor.record_suspicious_activity(
+                request.META.get('REMOTE_ADDR'), 
+                'unauthorized_product_access'
+            )
             return JsonResponse({"error": "Casting product not found"}, status=404)
         
         # Transfer to production table
@@ -114,7 +149,7 @@ def move_to_production(request):
         # Remove from casting table
         dynamodb_service.delete_item('CASTING_PRODUCTS', {'product_id': product_id})
         
-        logger.info(f"Product moved to production: {product_id}")
+        logger.info(f"Product moved to production by user: {request.user_info.get('username')}")
         
         return JsonResponse({
             "message": "Casting product moved to production successfully",
@@ -123,46 +158,65 @@ def move_to_production(request):
         })
         
     except Exception as e:
-        logger.error(f"Error in move_to_production: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        return SecureErrorHandler.handle_error(e, "moving product to production")
 
-@csrf_exempt
+@csrf_protect
 @require_http_methods(["POST"])
+@jwt_required
+@validate_request_data(required_fields=['product_id'])
 def delete_casting_product(request):
     try:
-        body = json.loads(request.body)
-        
-        if 'product_id' not in body:
-            return JsonResponse({"error": "'product_id' is required"}, status=400)
-
+        body = request.validated_data
         product_id = body['product_id']
         
-        # Check if product exists
-        existing = dynamodb_service.get_item('CASTING_PRODUCTS', {'product_id': product_id})
+        # Validate product_id format
+        if not InputValidator.validate_uuid(product_id):
+            return SecureErrorHandler.validation_error("Invalid product ID format")
+        
+        # Verify user owns the product
+        existing = SecureDatabaseService.check_product_ownership(
+            product_id, 
+            request.user_info.get('username'), 
+            'CASTING_PRODUCTS'
+        )
         if not existing:
+            SecurityMonitor.record_suspicious_activity(
+                request.META.get('REMOTE_ADDR'), 
+                'unauthorized_delete_attempt'
+            )
             return JsonResponse({"error": "Casting product not found"}, status=404)
         
         # Delete the product
         dynamodb_service.delete_item('CASTING_PRODUCTS', {'product_id': product_id})
         
-        logger.info(f"Casting product deleted: {product_id}")
+        logger.info(f"Casting product deleted by user: {request.user_info.get('username')}")
         return JsonResponse({
             "message": "Casting product deleted successfully",
             "product_id": product_id
         })
         
     except Exception as e:
-        logger.error(f"Error in delete_casting_product: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        return SecureErrorHandler.handle_error(e, "product deletion")
 
-@csrf_exempt
+@csrf_protect
 @require_http_methods(["GET"])
+@jwt_required
 def get_all_casting_products(request):
     try:
-        casting_products = dynamodb_service.scan_table('CASTING_PRODUCTS')
-        logger.info(f"Found {len(casting_products)} casting products")
-        return JsonResponse(casting_products, safe=False)
+        username = request.user_info.get('username')
+        user_role = request.user_info.get('role', 'user')
+        
+        # Get user-specific products or all products for admin
+        if user_role == 'admin':
+            casting_products = dynamodb_service.scan_table('CASTING_PRODUCTS')
+        else:
+            casting_products = SecureDatabaseService.get_user_products(username, 'CASTING_PRODUCTS')
+        
+        # Sanitize results based on user role
+        sanitized_products = SecureDatabaseService.sanitize_scan_results(casting_products, user_role)
+        
+        logger.info(f"User {username} retrieved {len(sanitized_products)} casting products")
+        return JsonResponse(sanitized_products, safe=False)
         
     except Exception as e:
-        logger.error(f"Error in get_all_casting_products: {e}")
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+        return SecureErrorHandler.handle_error(e, "retrieving products")

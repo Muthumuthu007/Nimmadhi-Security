@@ -28,7 +28,7 @@ def create_grn(request):
             'date', 'supplierName', 'rawMaterial', 'billNumber',
             'billDate', 'billedQuantity', 'receivedQuantity', 'transport',
             'tallyReference', 'costing', 'taxPercentage', 'sgstAmount',
-            'cgstAmount', 'totalAmount'
+            'cgstAmount', 'igstAmount', 'totalAmount'
         ]
         
         for field in required_fields:
@@ -54,6 +54,7 @@ def create_grn(request):
             'taxPercentage': Decimal(str(body['taxPercentage'])),
             'sgstAmount': Decimal(str(body['sgstAmount'])),
             'cgstAmount': Decimal(str(body['cgstAmount'])),
+            'igstAmount': Decimal(str(body['igstAmount'])),
             'totalAmount': Decimal(str(body['totalAmount'])),
             'created_at': datetime.now().isoformat()
         }
@@ -79,6 +80,7 @@ def create_grn(request):
             "taxPercentage": float(body['taxPercentage']),
             "sgstAmount": float(body['sgstAmount']),
             "cgstAmount": float(body['cgstAmount']),
+            "igstAmount": float(body['igstAmount']),
             "totalAmount": float(body['totalAmount'])
         })
         
@@ -173,4 +175,79 @@ def get_grn_by_transport(request, transport_type):
         
     except Exception as e:
         logger.error(f"Error retrieving GRN records for transport {transport_type}: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def get_grn_by_supplier_name(request, supplier_name):
+    """Get all GRN records filtered by supplier name"""
+    try:
+        # Scan table and filter by supplier name
+        grn_records = dynamodb_service.scan_table(
+            'GRN_TABLE',
+            FilterExpression='supplierName = :supplier_name',
+            ExpressionAttributeValues={
+                ':supplier_name': supplier_name
+            }
+        )
+        
+        if not grn_records:
+            return JsonResponse({"message": "No data found", "data": []})
+        
+        # Convert Decimal values to float for JSON response
+        response_data = []
+        for record in grn_records:
+            converted_record = {}
+            for key, value in record.items():
+                if isinstance(value, Decimal):
+                    converted_record[key] = float(value)
+                else:
+                    converted_record[key] = value
+            response_data.append(converted_record)
+        
+        logger.info(f"Found {len(response_data)} GRN records for supplier: {supplier_name}")
+        return JsonResponse({
+            "message": f"Found {len(response_data)} GRN records",
+            "supplier_name": supplier_name,
+            "data": response_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving GRN records for supplier {supplier_name}: {e}")
+        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def list_all_grn(request):
+    """Get all GRN records from the table"""
+    try:
+        # Scan entire GRN table
+        grn_records = dynamodb_service.scan_table('GRN_TABLE')
+        
+        if not grn_records:
+            return JsonResponse({"message": "No GRN records found", "data": [], "total_count": 0})
+        
+        # Convert Decimal values to float for JSON response
+        response_data = []
+        for record in grn_records:
+            converted_record = {}
+            for key, value in record.items():
+                if isinstance(value, Decimal):
+                    converted_record[key] = float(value)
+                else:
+                    converted_record[key] = value
+            response_data.append(converted_record)
+        
+        # Sort by created_at (newest first)
+        response_data.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        
+        logger.info(f"Retrieved {len(response_data)} GRN records")
+        return JsonResponse({
+            "message": f"Found {len(response_data)} GRN records",
+            "total_count": len(response_data),
+            "data": response_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving all GRN records: {e}")
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)

@@ -231,8 +231,8 @@ def create_stock(request):
     try:
         body = json.loads(request.body)
         
-        # Exact Lambda validation
-        required = ['name', 'quantity', 'defective', 'cost_per_unit', 'stock_limit', 'username', 'unit', 'group_id']
+        # Updated validation to include GST
+        required = ['name', 'quantity', 'defective', 'cost_per_unit', 'stock_limit', 'username', 'unit', 'group_id', 'gst']
         for field in required:
             if field not in body:
                 return JsonResponse({"error": f"'{field}' is required"}, status=400)
@@ -243,26 +243,35 @@ def create_stock(request):
         if existing:
             return JsonResponse({"message": "already exist"}, status=400)
 
-        # Parse inputs exactly like Lambda
+        # Parse inputs including GST
         quantity = Decimal(str(body['quantity']))
         defective = Decimal(str(body['defective']))
         cost_per_unit = Decimal(str(body['cost_per_unit']))
         stock_limit = Decimal(str(body['stock_limit']))
+        gst = Decimal(str(body['gst']))
         username = body['username']
         unit = body['unit']
         group_id = body['group_id']
 
-        # Compute derived values exactly like Lambda
+        # Validate GST percentage
+        if gst < 0 or gst > 100:
+            return JsonResponse({"error": "GST percentage must be between 0 and 100"}, status=400)
+
+        # Compute derived values with GST
         available_qty = quantity - defective
-        total_cost = available_qty * cost_per_unit
+        base_cost = available_qty * cost_per_unit
+        gst_amount = (base_cost * gst) / Decimal('100')
+        total_cost = base_cost + gst_amount
         now_iso = datetime.now().isoformat()
 
-        # Persist exactly like Lambda
+        # Persist with GST fields
         stock_item = {
             'item_id': item_id,
             'name': item_id,
             'quantity': int(available_qty),
             'cost_per_unit': cost_per_unit,
+            'gst': gst,
+            'gst_amount': gst_amount,
             'total_cost': total_cost,
             'stock_limit': stock_limit,
             'defective': int(defective),
@@ -276,13 +285,15 @@ def create_stock(request):
         
         dynamodb_service.put_item('STOCK', stock_item)
         
-        # Log transaction exactly like Lambda
+        # Log transaction with GST details
         log_transaction("CreateStock", {
             'item_id': item_id,
             'available_qty': int(available_qty),
             'defective': int(defective),
             'total_qty': int(quantity),
             'cost_per_unit': float(cost_per_unit),
+            'gst': float(gst),
+            'gst_amount': float(gst_amount),
             'total_cost': float(total_cost),
             'stock_limit': float(stock_limit),
             'unit': unit,
@@ -297,13 +308,15 @@ def create_stock(request):
         recalc_all_production()
         logger.info(f"Stock created: {item_id}")
         
-        # Return exact Lambda response format
+        # Return response with GST details
         return JsonResponse({
             "message": "Stock created successfully.",
             "item_id": item_id,
             "quantity": int(available_qty),
             "total_quantity": int(quantity),
             "cost_per_unit": float(cost_per_unit),
+            "gst": float(gst),
+            "gst_amount": float(gst_amount),
             "total_cost": float(total_cost),
             "stock_limit": float(stock_limit),
             "defective": int(defective),
@@ -620,13 +633,14 @@ def add_stock_quantity(request):
         body = json.loads(request.body)
         
         # Lambda uses 'name' and 'quantity_to_add'
-        required = ['name', 'quantity_to_add', 'username']
+        required = ['name', 'quantity_to_add', 'username', 'supplier_name']
         for field in required:
             if field not in body:
                 return JsonResponse({"error": f"'{field}' is required"}, status=400)
 
         item_id = body['name']
         username = body['username']
+        supplier_name = body['supplier_name']  # Mandatory field
         
         try:
             q_add = Decimal(str(body['quantity_to_add']))
@@ -640,34 +654,40 @@ def add_stock_quantity(request):
         if not existing:
             return JsonResponse({"error": f"Stock item '{item_id}' not found."}, status=404)
         
-        # Before values (exact Lambda logic)
+        # Before values with GST
         before_available = Decimal(str(existing.get('quantity', 0)))
         before_defective = Decimal(str(existing.get('defective', 0)))
         before_total = before_available + before_defective
         before_total_cost = Decimal(str(existing.get('total_cost', 0)))
         cost_per_unit = Decimal(str(existing.get('cost_per_unit', 0)))
+        gst = Decimal(str(existing.get('gst', 0)))
 
-        # Compute after values
+        # Compute after values with GST
         after_available = before_available + q_add
         after_total = after_available + before_defective
-        added_cost = cost_per_unit * q_add
+        base_added_cost = cost_per_unit * q_add
+        gst_amount = (base_added_cost * gst) / Decimal('100')
+        added_cost = base_added_cost + gst_amount
         after_total_cost = before_total_cost + added_cost
         now_ts = datetime.now().isoformat()
 
-        # Update stock
+        # Update stock with GST
         existing.update({
             'quantity': after_available,
             'total_quantity': after_total,
+            'gst_amount': Decimal(str(existing.get('gst_amount', 0))) + gst_amount,
             'total_cost': after_total_cost,
             'updated_at': now_ts
         })
         dynamodb_service.put_item('STOCK', existing)
         
-        # Log exactly like Lambda
-        log_transaction("AddStockQuantity", {
+        # Log with GST details
+        transaction_data = {
             "item_id": item_id,
             "quantity_added": float(q_add),
             "cost_per_unit": float(cost_per_unit),
+            "gst": float(gst),
+            "gst_amount": float(gst_amount),
             "added_cost": float(added_cost),
             "before_available": float(before_available),
             "before_defective": float(before_defective),
@@ -676,7 +696,11 @@ def add_stock_quantity(request):
             "after_available": float(after_available),
             "after_total": float(after_total),
             "after_total_cost": float(after_total_cost),
-        }, username)
+        }
+        
+        transaction_data["supplier_name"] = supplier_name
+            
+        log_transaction("AddStockQuantity", transaction_data, username)
 
         log_undo_action("AddStockQuantity", {
             "item_id": item_id,
@@ -685,16 +709,22 @@ def add_stock_quantity(request):
 
         recalc_all_production()
         
-        return JsonResponse({
+        response_data = {
             "message": f"Added {float(q_add)} units to stock '{item_id}'.",
             "item_id": item_id,
             "quantity_added": float(q_add),
             "new_available": float(after_available),
             "new_total": float(after_total),
+            "gst": float(gst),
+            "gst_amount": float(gst_amount),
             "added_cost": float(added_cost),
             "new_total_cost": float(after_total_cost),
             "updated_at": now_ts
-        })
+        }
+        
+        response_data["supplier_name"] = supplier_name
+            
+        return JsonResponse(response_data)
         
     except Exception as e:
         logger.error(f"Error in add_stock_quantity: {e}")
