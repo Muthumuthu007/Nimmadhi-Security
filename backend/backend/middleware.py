@@ -64,3 +64,18 @@ class SecurityHeadersMiddleware:
             response['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains; preload'
         
         return response
+
+class NoCacheMiddleware:
+    """Middleware to disable all browser caching"""
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        
+        # Disable all caching - forces fresh fetch from server
+        response['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response['Pragma'] = 'no-cache'
+        response['Expires'] = '0'
+        
+        return response

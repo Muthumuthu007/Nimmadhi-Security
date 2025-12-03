@@ -37,17 +37,16 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    'django.middleware.cache.UpdateCacheMiddleware',
     'django.middleware.gzip.GZipMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'backend.middleware.NoCacheMiddleware',
     'backend.middleware.SecurityHeadersMiddleware',
     'backend.security_monitor.security_monitor_middleware',
     'backend.middleware.RateLimitMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'django.middleware.cache.FetchFromCacheMiddleware',
 ]
 
 # Compression settings
@@ -88,7 +87,7 @@ SESSION_COOKIE_AGE = 3600  # 1 hour
 RATE_LIMIT_ENABLE = os.environ.get('RATE_LIMIT_ENABLE', 'True').lower() == 'true'
 RATE_LIMIT_PER_MINUTE = int(os.environ.get('RATE_LIMIT_PER_MINUTE', '60'))
 
-# Cache Configuration (for rate limiting and performance)
+# Cache Configuration (for rate limiting only - not for response caching)
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
@@ -99,11 +98,6 @@ CACHES = {
         }
     }
 }
-
-# Cache settings
-CACHE_MIDDLEWARE_ALIAS = 'default'
-CACHE_MIDDLEWARE_SECONDS = 300
-CACHE_MIDDLEWARE_KEY_PREFIX = 'backend'
 
 ROOT_URLCONF = 'backend.urls'
 
