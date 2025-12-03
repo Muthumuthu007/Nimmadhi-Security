@@ -15,6 +15,7 @@ from django.core.cache import cache
 from django.conf import settings
 from backend.dynamodb_service import dynamodb_service
 from botocore.exceptions import ClientError
+from users.decorators import jwt_required
 
 
 logger = logging.getLogger(__name__)
@@ -122,334 +123,31 @@ class DecimalEncoder(json.JSONEncoder):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_daily_consumption_summary(request, body=None):
-    """Get daily stock report including both inward additions and consumption"""
-    try:
-        if body is None:
-            body = json.loads(request.body)
-
-        # 1) Validate operation - exact Lambda check
-        if body.get("operation") != "GetDailyConsumptionSummary":
-            return JsonResponse({"error": "Invalid operation for daily consumption summary."}, status=400)
-
-        # 2) Determine report_date (IST) - exact Lambda logic
-        report_date = body.get("report_date")
-        if not report_date:
-            report_date = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
-        report_date = report_date.strip()
-
-        # 3) Load transactions efficiently with date index
-        try:
-            # Try GSI query first (faster)
-            txns = dynamodb_service.query_table(
-                'stock_transactions',
-                IndexName='DateIndex',
-                KeyConditionExpression=Key('date').eq(report_date)
-            )
-        except:
-            # Fallback to scan with filter
-            txns = dynamodb_service.scan_table(
-                'stock_transactions',
-                FilterExpression=Attr('date').eq(report_date)
-            )
-
-        # 4) Direct GSI query with date index only
-        cache_key = f"daily_report_{report_date}"
-        cached_result = cache.get(cache_key)
-        if cached_result:
-            return JsonResponse(cached_result, encoder=DecimalEncoder)
-        
-        # Single fast query using DateIndex
-        txns = dynamodb_service.query_table(
-            'stock_transactions',
-            IndexName='DateIndex',
-            KeyConditionExpression=Key('date').eq(report_date)
-        )
-        
-        consumption_details = extract_consumption_details(txns)
-        inward_details = extract_inward_details(txns)
-
-        # 6) Summarize consumption per‐item quantities - exact Lambda logic
-        consumption_map = defaultdict(Decimal)
-        for d in consumption_details:
-            consumption_map[d['item_id']] += Decimal(str(d['quantity_consumed']))
-            
-        # 7) Summarize inward per-item quantities - NEW: track stock additions
-        inward_map = defaultdict(lambda: {'quantity': Decimal('0'), 'cost': Decimal('0'), 'suppliers': set()})
-        for d in inward_details:
-            item_id = d['item_id']
-            inward_map[item_id]['quantity'] += Decimal(str(d['quantity_added']))
-            inward_map[item_id]['cost'] += Decimal(str(d['added_cost']))
-            inward_map[item_id]['suppliers'].add(d['supplier_name'])
-
-        # 8) Ultra-fast batch lookup for all items
-        all_items = list(set(consumption_map.keys()) | set(inward_map.keys()))
-        
-        # Batch get all stock items at once (100x faster)
-        stock_items = dynamodb_service.batch_get_items('STOCK', [{'item_id': item_id} for item_id in all_items])
-        stock_lookup = {item['item_id']: item for item in stock_items}
-        
-        flat = []
-        for item_id in all_items:
-            stock_item = stock_lookup.get(item_id, {})
-            group_id = stock_item.get('group_id')
-
-            # build full chain: [top_group, sub_group, ...] - exact Lambda chain building
-            chain = get_group_chain(group_id) if group_id else []
-            group    = chain[0] if len(chain) >= 1 else None
-            subgroup = chain[1] if len(chain) >= 2 else None
-            
-            # Get consumption and inward data
-            consumed_qty = float(consumption_map.get(item_id, Decimal('0')))
-            inward_data = inward_map.get(item_id, {'quantity': Decimal('0'), 'cost': Decimal('0'), 'suppliers': set()})
-            added_qty = float(inward_data['quantity'])
-            added_cost = float(inward_data['cost'])
-            suppliers = list(inward_data['suppliers']) if inward_data['suppliers'] else []
-
-            flat.append({
-                "item_id":                 item_id,
-                "group":                   group,
-                "subgroup":                subgroup,
-                "total_quantity_consumed": consumed_qty,
-                "total_quantity_added":    added_qty,
-                "total_added_cost":        added_cost,
-                "suppliers":               suppliers
-            })
-
-        # 9) Nest into { group → { subgroup → [items…] } } - enhanced nesting
-        nested = {}
-        for e in flat:
-            g = e['group'] or "Unknown"
-            s = e['subgroup'] or "Unknown"
-            nested.setdefault(g, {}).setdefault(s, []).append({
-                "item_id":                 e["item_id"],
-                "total_quantity_consumed": e["total_quantity_consumed"],
-                "total_quantity_added":    e["total_quantity_added"],
-                "total_added_cost":        e["total_added_cost"],
-                "suppliers":               e["suppliers"]
-            })
-
-        # 10) Compute grand totals - enhanced calculation
-        total_consumed_qty = sum(consumption_map.values())
-        total_consumed_amt = Decimal('0')
-        for item_id, qty in consumption_map.items():
-            stock_item = dynamodb_service.get_item('STOCK', {'item_id': item_id})
-            if stock_item:
-                rate = Decimal(str(stock_item.get('cost_per_unit', 0)))
-                total_consumed_amt += rate * qty
-                
-        total_added_qty = sum(data['quantity'] for data in inward_map.values())
-        total_added_amt = sum(data['cost'] for data in inward_map.values())
-
-        # 11) Build and return - enhanced payload with caching
-        payload = {
-            "report_date":                report_date,
-            "stock_summary":              nested,
-            "total_consumption_quantity": float(total_consumed_qty),
-            "total_consumption_amount":   float(total_consumed_amt),
-            "total_inward_quantity":      float(total_added_qty),
-            "total_inward_amount":        float(total_added_amt)
-        }
-        
-        # Cache for 5 minutes
-        cache.set(cache_key, payload, 300)
-        return JsonResponse(payload, encoder=DecimalEncoder)
-
-    except Exception as e:
-        logger.error(f"Error in get_daily_consumption_summary: {e}", exc_info=True)
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+    """Optimized daily consumption summary - delegates to optimized module"""
+    from .optimized_consumption import get_daily_consumption_summary as optimized_daily
+    return optimized_daily(request, body)
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_weekly_consumption_summary(request, body=None):
-    """Get weekly consumption summary - exact Lambda replication"""
-    try:
-        if body is None:
-            body = json.loads(request.body)
-        
-        # 1) Determine IST date window - exact Lambda logic
-        now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        end_date = body.get("end_date", now.strftime("%Y-%m-%d")).strip()
-        start_date = body.get("start_date", (now - timedelta(days=7)).strftime("%Y-%m-%d")).strip()
-        
-        # Parse into date objects
-        sd_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
-        ed_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
-        
-        # 2) Scan all transactions in [start_date..end_date] - exact Lambda filter
-        from boto3.dynamodb.conditions import Attr
-        date_filter = Attr('date').gte(start_date) & Attr('date').lte(end_date)
-        txns = dynamodb_service.scan_table('stock_transactions', FilterExpression=date_filter)
-        
-        # 3) Extract only consumption details - exact Lambda helper
-        consumption_details = extract_consumption_details(txns)
-        
-        # 4) Prepare flat list enriched with date, group, subgroup - exact Lambda logic
-        flat = []
-        for d in consumption_details:
-            item_id = d['item_id']
-            qty = Decimal(str(d['quantity_consumed']))
-            # Derive date from timestamp "YYYY-MM-DD hh:mm:ss AM/PM" - exact Lambda logic
-            date_key = d['timestamp'].split(' ')[0]
-            
-            # Lookup group_id - exact Lambda lookup
-            stock_item = dynamodb_service.get_item('STOCK', {'item_id': item_id})
-            group_id = stock_item.get('group_id') if stock_item else None
-            
-            # Build group chain - exact Lambda chain building
-            chain = get_group_chain(group_id) if group_id else []
-            group = chain[0] if len(chain) >= 1 else "Unknown"
-            subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-            
-            flat.append({
-                "date": date_key,
-                "group": group,
-                "subgroup": subgroup,
-                "item_id": item_id,
-                "quantity": float(qty)
-            })
-        
-        # 5) Initialize nested structure with every date in range - exact Lambda logic
-        nested = {}
-        cur = sd_dt
-        while cur <= ed_dt:
-            nested[cur.strftime("%Y-%m-%d")] = {}
-            cur += timedelta(days=1)
-        
-        # 6) Populate nested[date][group][subgroup] = [items...] - exact Lambda nesting
-        for e in flat:
-            dt = e['date']
-            g = e['group']
-            s = e['subgroup']
-            nested.setdefault(dt, {}).setdefault(g, {}).setdefault(s, []).append({
-                "item_id": e["item_id"],
-                "quantity": e["quantity"]
-            })
-        
-        # 7) Compute grand totals - exact Lambda calculation
-        total_qty = sum(Decimal(str(e['quantity'])) for e in flat)
-        total_amt = Decimal('0')
-        for e in flat:
-            stock_item = dynamodb_service.get_item('STOCK', {'item_id': e['item_id']})
-            if stock_item:
-                rate = Decimal(str(stock_item.get('cost_per_unit', 0)))
-                total_amt += rate * Decimal(str(e['quantity']))
-        
-        # 8) Assemble and return - exact Lambda payload
-        payload = {
-            "report_date": end_date,
-            "consumption_summary": nested,
-            "total_consumption_quantity": float(total_qty),
-            "total_consumption_amount": float(total_amt)
-        }
-        
-        return JsonResponse(payload, encoder=DecimalEncoder)
-        
-    except Exception as e:
-        logger.error(f"Error in get_weekly_consumption_summary: {e}", exc_info=True)
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+    """Optimized weekly consumption summary - delegates to optimized module"""
+    from .optimized_consumption import get_weekly_consumption_summary as optimized_weekly
+    return optimized_weekly(request, body)
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_monthly_consumption_summary(request, body=None):
-    """Get monthly consumption summary - exact Lambda replication"""
-    try:
-        if body is None:
-            body = json.loads(request.body)
-        
-        month_str = body.get("month")
-        if not isinstance(month_str, str):
-            return JsonResponse({"error": "'month' parameter is required in format YYYY-MM"}, status=400)
-        month_str = month_str.strip()
-        try:
-            year, month = map(int, month_str.split("-"))
-        except ValueError:
-            return JsonResponse({"error": "'month' must be in format YYYY-MM"}, status=400)
-        
-        # 1) Determine first and last day of month - exact Lambda logic
-        first_day = date(year, month, 1)
-        last_day = date(year, month, calendar.monthrange(year, month)[1])
-        start_date = first_day.strftime("%Y-%m-%d")
-        end_date = last_day.strftime("%Y-%m-%d")
-        
-        # Parse into date objects for iteration
-        sd_dt = first_day
-        ed_dt = last_day
-        
-        # 2) Scan all transactions in [start_date..end_date] - exact Lambda filter
-        from boto3.dynamodb.conditions import Attr
-        date_filter = Attr('date').gte(start_date) & Attr('date').lte(end_date)
-        txns = dynamodb_service.scan_table('stock_transactions', FilterExpression=date_filter)
-        
-        # 3) Extract only consumption details - exact Lambda helper
-        consumption_details = extract_consumption_details(txns)
-        
-        # 4) Prepare flat enriched list - exact Lambda logic
-        flat = []
-        for d in consumption_details:
-            item_id = d['item_id']
-            qty = Decimal(str(d['quantity_consumed']))
-            date_key = d['timestamp'].split(' ')[0]
-            
-            stock_item = dynamodb_service.get_item('STOCK', {'item_id': item_id})
-            group_id = stock_item.get('group_id') if stock_item else None
-            
-            chain = get_group_chain(group_id) if group_id else []
-            group = chain[0] if len(chain) >= 1 else "Unknown"
-            subgroup = chain[1] if len(chain) >= 2 else "Unknown"
-            
-            flat.append({
-                "date": date_key,
-                "group": group,
-                "subgroup": subgroup,
-                "item_id": item_id,
-                "quantity": float(qty)
-            })
-        
-        # 5) Initialize nested[date] - exact Lambda logic
-        nested = {}
-        cur = sd_dt
-        while cur <= ed_dt:
-            nested[cur.strftime("%Y-%m-%d")] = {}
-            cur += timedelta(days=1)
-        
-        # 6) Populate nested[date][group][subgroup] - exact Lambda nesting
-        for e in flat:
-            dt = e['date']
-            g = e['group']
-            s = e['subgroup']
-            nested.setdefault(dt, {}).setdefault(g, {}).setdefault(s, []).append({
-                "item_id": e["item_id"],
-                "quantity": e["quantity"]
-            })
-        
-        # 7) Compute grand totals - exact Lambda calculation
-        total_qty = sum(Decimal(str(e['quantity'])) for e in flat)
-        total_amt = Decimal('0')
-        for e in flat:
-            stock_item = dynamodb_service.get_item('STOCK', {'item_id': e['item_id']})
-            if stock_item:
-                rate = Decimal(str(stock_item.get('cost_per_unit', 0)))
-                total_amt += rate * Decimal(str(e['quantity']))
-        
-        # 8) Assemble and return - exact Lambda payload
-        payload = {
-            "month": month_str,
-            "start_date": start_date,
-            "end_date": end_date,
-            "consumption_summary": nested,
-            "total_consumption_quantity": float(total_qty),
-            "total_consumption_amount": float(total_amt)
-        }
-        
-        return JsonResponse(payload, encoder=DecimalEncoder)
-        
-    except Exception as e:
-        logger.error(f"Error in get_monthly_consumption_summary: {e}", exc_info=True)
-        return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
+    """Optimized monthly consumption summary - delegates to optimized module"""
+    from .optimized_consumption import get_monthly_consumption_summary as optimized_monthly
+    return optimized_monthly(request, body)
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_daily_inward(request):
     """Get daily inward report - direct URL access"""
     try:
@@ -467,6 +165,7 @@ def get_daily_inward(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_weekly_inward(request):
     """Get weekly inward report - direct URL access"""
     try:
@@ -485,6 +184,7 @@ def get_weekly_inward(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_monthly_inward(request):
     """Get monthly inward report - direct URL access"""
     try:
@@ -520,6 +220,7 @@ def get_monthly_inward(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_all_stock_transactions(request):
     """Get all stock transactions - converted from Lambda get_all_stock_transactions function"""
     try:
@@ -559,6 +260,7 @@ def get_all_stock_transactions(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_today_logs(request):
     """Get today's logs - converted from Lambda get_today_logs function"""
     try:
@@ -633,6 +335,7 @@ def get_today_logs(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_daily_push_to_production(request):
     """Get daily push to production report"""
     try:
@@ -686,6 +389,7 @@ def get_daily_push_to_production(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_weekly_push_to_production(request):
     """Get weekly push to production report"""
     try:
@@ -747,6 +451,7 @@ def get_weekly_push_to_production(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_monthly_push_to_production(request):
     """Get monthly push to production report"""
     try:
@@ -808,6 +513,7 @@ def get_monthly_push_to_production(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_monthly_production_summary(request):
     """Get monthly production summary"""
     try:
@@ -878,6 +584,7 @@ def get_monthly_production_summary(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_item_history(request):
     """Get item history - converted from Lambda get_item_history function"""
     try:
@@ -1007,6 +714,7 @@ def get_item_history(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_monthly_inward_grid(request, body=None):
     """Get monthly inward grid - returns all materials like outward grid"""
     try:
@@ -1128,6 +836,7 @@ def get_monthly_inward_grid(request, body=None):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_monthly_outward_grid(request, body=None):
     """Get monthly outward grid - optimized with GSI queries"""
     try:

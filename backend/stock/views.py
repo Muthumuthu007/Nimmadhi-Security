@@ -9,6 +9,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from backend.dynamodb_service import dynamodb_service
 from botocore.exceptions import ClientError
+from users.decorators import jwt_required, admin_required
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ def recalc_all_production():
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
+@jwt_required
 def get_all_stock_transactions(request):
     """Get all stock transactions for reporting"""
     try:
@@ -129,6 +131,7 @@ def mark_undo_as_done(undo_id):
 # Stub functions for all required endpoints
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def create_group(request):
     try:
         body = json.loads(request.body)
@@ -165,6 +168,8 @@ def create_group(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def delete_group(request):
     try:
         body = json.loads(request.body)
@@ -194,6 +199,7 @@ def delete_group(request):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def list_groups(request):
     try:
         parent_id = request.GET.get('parent_id')
@@ -227,6 +233,7 @@ def list_groups(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def create_stock(request):
     try:
         body = json.loads(request.body)
@@ -331,6 +338,7 @@ def create_stock(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def update_stock(request):
     try:
         body = json.loads(request.body)
@@ -457,6 +465,8 @@ def update_stock(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def delete_stock(request):
     try:
         body = json.loads(request.body)
@@ -493,6 +503,7 @@ def delete_stock(request):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def get_all_stocks(request):
     try:
         group_id = request.GET.get('group_id')
@@ -575,6 +586,7 @@ def get_all_stocks(request):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def list_inventory_stock(request):
     try:
         # Get query parameters
@@ -629,6 +641,7 @@ def list_inventory_stock(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def add_stock_quantity(request):
     try:
         body = json.loads(request.body)
@@ -733,6 +746,7 @@ def add_stock_quantity(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def subtract_stock_quantity(request):
     try:
         body = json.loads(request.body)
@@ -828,6 +842,7 @@ def subtract_stock_quantity(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def add_defective_goods(request):
     try:
         body = json.loads(request.body)
@@ -893,6 +908,7 @@ def add_defective_goods(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def subtract_defective_goods(request):
     try:
         body = json.loads(request.body)
@@ -960,6 +976,7 @@ def subtract_defective_goods(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def create_description(request):
     try:
         body = json.loads(request.body)
@@ -985,6 +1002,7 @@ def create_description(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_description(request):
     try:
         body = json.loads(request.body)
@@ -1012,6 +1030,7 @@ def get_description(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_all_descriptions(request):
     try:
         descriptions = dynamodb_service.scan_table('stock_remarks')
@@ -1024,6 +1043,7 @@ def get_all_descriptions(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def save_opening_stock(request):
     try:
         body = json.loads(request.body)
@@ -1139,6 +1159,7 @@ def save_opening_stock(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def save_closing_stock(request):
     try:
         body = json.loads(request.body)
@@ -1254,6 +1275,7 @@ def save_closing_stock(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def create_product(request):
     try:
         body = json.loads(request.body)
@@ -1364,6 +1386,7 @@ def create_product(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def update_product(request):
     try:
         body = json.loads(request.body)
@@ -1466,6 +1489,7 @@ def update_product(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def update_product_details(request):
     try:
         body = json.loads(request.body)
@@ -1509,6 +1533,8 @@ def update_product_details(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def delete_product(request):
     try:
         body = json.loads(request.body)
@@ -1534,6 +1560,7 @@ def delete_product(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_all_products(request):
     try:
         products = dynamodb_service.scan_table('PRODUCTION')
@@ -1587,6 +1614,7 @@ def get_all_products(request):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def debug_stock_items(request):
     """Debug endpoint to check stock items"""
     try:
@@ -1619,6 +1647,7 @@ def debug_stock_items(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def alter_product_components(request):
     try:
         body = json.loads(request.body)
@@ -1765,6 +1794,7 @@ def alter_product_components(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def push_to_production(request):
     try:
         body = json.loads(request.body)
@@ -1894,6 +1924,8 @@ def push_to_production(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def undo_production(request):
     try:
         body = json.loads(request.body)
@@ -1966,6 +1998,8 @@ def undo_production(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def delete_push_to_production(request):
     try:
         body = json.loads(request.body)
@@ -2002,6 +2036,8 @@ def delete_push_to_production(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def undo_action(request):
     try:
         body = json.loads(request.body)
@@ -2038,6 +2074,8 @@ def undo_action(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def delete_transaction_data(request):
     try:
         body = json.loads(request.body)
@@ -2082,6 +2120,7 @@ def delete_transaction_data(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def test_stock_lookup(request):
     """Test endpoint to verify stock lookup functionality"""
     try:
@@ -2106,6 +2145,7 @@ def test_stock_lookup(request):
 
 # Lambda-style functions for operation routing
 @csrf_exempt
+@jwt_required
 def creategroup(request, body):
     try:
         if 'name' not in body:
@@ -2139,6 +2179,7 @@ def creategroup(request, body):
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 @csrf_exempt
+@jwt_required
 def listgroups(request, body=None):
     # Handle both direct calls and lambda-style calls
     if body is None:
@@ -2177,6 +2218,7 @@ def listgroups(request, body=None):
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 @csrf_exempt
+@jwt_required
 def deletegroup(request, body):
     try:
         if 'group_id' not in body:

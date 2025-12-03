@@ -232,6 +232,11 @@ def _build_transactions_section_without_opening(start_date, end_date):
 @csrf_exempt
 @require_http_methods(['POST'])
 def get_daily_report(request):
+    """Optimized - delegates to optimized module"""
+    from .optimized_normal_reports import get_daily_report as optimized
+    return optimized(request)
+
+def get_daily_report_old(request):
     try:
         body = json.loads(request.body) if request.body else {}
         rd = body.get('report_date')
@@ -375,6 +380,11 @@ def get_daily_report(request):
 @csrf_exempt
 @require_http_methods(['POST'])
 def get_weekly_report(request):
+    """Optimized - delegates to optimized module"""
+    from .optimized_normal_reports import get_weekly_report as optimized
+    return optimized(request)
+
+def get_weekly_report_old(request):
     try:
         body = json.loads(request.body) if request.body else {}
         now = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -477,6 +487,11 @@ def get_weekly_report(request):
 @csrf_exempt
 @require_http_methods(['POST'])
 def get_monthly_report(request):
+    """Optimized - delegates to optimized module"""
+    from .optimized_normal_reports import get_monthly_report as optimized
+    return optimized(request)
+
+def get_monthly_report_old(request):
     try:
         body = json.loads(request.body) if request.body else {}
         m = body.get('month')

@@ -7,6 +7,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from backend.dynamodb_service import dynamodb_service
+from users.decorators import jwt_required, admin_required
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ class DecimalEncoder(json.JSONEncoder):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def create_grn(request):
     """Create a new GRN record"""
     try:
@@ -92,6 +94,7 @@ def create_grn(request):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def get_grn(request, grn_id):
     """Get GRN by ID"""
     try:
@@ -118,6 +121,8 @@ def get_grn(request, grn_id):
 
 @csrf_exempt
 @require_http_methods(["DELETE"])
+@jwt_required
+@admin_required
 def delete_grn(request, grn_id):
     """Delete GRN by ID"""
     try:
@@ -139,6 +144,7 @@ def delete_grn(request, grn_id):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def get_grn_by_transport(request, transport_type):
     """Get all GRN records filtered by transport type"""
     try:
@@ -179,6 +185,7 @@ def get_grn_by_transport(request, transport_type):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def get_grn_by_supplier_name(request, supplier_name):
     """Get all GRN records filtered by supplier name"""
     try:
@@ -218,6 +225,7 @@ def get_grn_by_supplier_name(request, supplier_name):
 
 @csrf_exempt
 @require_http_methods(["GET"])
+@jwt_required
 def list_all_grn(request):
     """Get all GRN records from the table"""
     try:

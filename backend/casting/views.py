@@ -5,7 +5,7 @@ from decimal import Decimal
 from datetime import datetime
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
-from django.views.decorators.csrf import csrf_protect
+from django.views.decorators.csrf import csrf_exempt
 from backend.dynamodb_service import dynamodb_service
 from backend.validators import InputValidator, validate_request_data
 from backend.error_handlers import SecureErrorHandler
@@ -16,7 +16,7 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-@csrf_protect
+@csrf_exempt
 @require_http_methods(["POST"])
 @jwt_required
 @validate_request_data(required_fields=['product_name', 'stock_needed', 'username', 'labour_cost', 'transport_cost', 'other_cost', 'wastage_percent'])
@@ -107,7 +107,7 @@ def create_casting_product(request):
     except Exception as e:
         return SecureErrorHandler.handle_error(e, "product creation")
 
-@csrf_protect
+@csrf_exempt
 @require_http_methods(["POST"])
 @jwt_required
 @validate_request_data(required_fields=['product_id'])
@@ -160,7 +160,7 @@ def move_to_production(request):
     except Exception as e:
         return SecureErrorHandler.handle_error(e, "moving product to production")
 
-@csrf_protect
+@csrf_exempt
 @require_http_methods(["POST"])
 @jwt_required
 @validate_request_data(required_fields=['product_id'])
@@ -198,7 +198,7 @@ def delete_casting_product(request):
     except Exception as e:
         return SecureErrorHandler.handle_error(e, "product deletion")
 
-@csrf_protect
+@csrf_exempt
 @require_http_methods(["GET"])
 @jwt_required
 def get_all_casting_products(request):

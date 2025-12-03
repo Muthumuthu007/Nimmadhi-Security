@@ -8,6 +8,7 @@ from django.views.decorators.http import require_http_methods
 from .models import FreightInwardService
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
+from users.decorators import jwt_required, admin_required
 
 
 def decimal_serializer(obj):
@@ -19,6 +20,7 @@ def decimal_serializer(obj):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def create_freight_note(request):
     """Create a new freight inward note"""
     try:
@@ -77,6 +79,7 @@ def create_freight_note(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def get_freight_note(request):
     """Get a specific freight note"""
     try:
@@ -105,6 +108,7 @@ def get_freight_note(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def list_freight_notes(request):
     """List all freight notes"""
     try:
@@ -121,6 +125,7 @@ def list_freight_notes(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
 def update_freight_note(request):
     """Update a freight note"""
     try:
@@ -160,6 +165,8 @@ def update_freight_note(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+@jwt_required
+@admin_required
 def delete_freight_note(request):
     """Delete a freight note"""
     try:

@@ -475,12 +475,44 @@ def delete_product(request):
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 @csrf_exempt
-@require_http_methods(["GET"])
 def get_all_products(request):
     try:
         from backend.dynamodb_service import dynamodb_service
+        from django.http import HttpResponse
+        
+        # Get all products and stock items
         products = dynamodb_service.scan_table('PRODUCTION')
-        return JsonResponse(products, safe=False)
+        stock_items = dynamodb_service.scan_table('STOCK')
+        
+        # Build stock map for quick lookup
+        stock_map = {item['item_id']: item for item in stock_items}
+        
+        # Enrich each product with material details
+        enriched_products = []
+        for product in products:
+            stock_needed = product.get('stock_needed', {})
+            materials = []
+            
+            for item_id, quantity in stock_needed.items():
+                stock_item = stock_map.get(item_id, {})
+                try:
+                    qty_value = float(quantity) if isinstance(quantity, (Decimal, str)) else quantity
+                except:
+                    qty_value = 0
+                    
+                materials.append({
+                    'item_id': item_id,
+                    'item_name': stock_item.get('name', item_id),
+                    'quantity': qty_value
+                })
+            
+            # Add materials list to product
+            product['materials'] = materials
+            enriched_products.append(product)
+        
+        # Serialize with DecimalEncoder
+        response_data = json.dumps(enriched_products, cls=DecimalEncoder)
+        return HttpResponse(response_data, content_type='application/json')
     except Exception as e:
         logger.error(f"Error in get_all_products: {e}")
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)

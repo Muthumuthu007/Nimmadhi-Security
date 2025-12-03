@@ -14,10 +14,13 @@ urlpatterns = [
     path('production/monthly/', views.get_monthly_push_to_production, name='get_monthly_push_to_production'),
     path('production/summary/monthly/', views.get_monthly_production_summary, name='get_monthly_production_summary'),
     
-    # Consumption reports
+    # Consumption reports (multiple URL patterns for compatibility)
     path('consumption/daily/', views.get_daily_consumption_summary, name='get_daily_consumption_summary'),
     path('consumption/weekly/', views.get_weekly_consumption_summary, name='get_weekly_consumption_summary'),
     path('consumption/monthly/', views.get_monthly_consumption_summary, name='get_monthly_consumption_summary'),
+    path('daily-consumption-summary/', views.get_daily_consumption_summary, name='daily_consumption_summary'),
+    path('weekly-consumption-summary/', views.get_weekly_consumption_summary, name='weekly_consumption_summary'),
+    path('monthly-consumption-summary/', views.get_monthly_consumption_summary, name='monthly_consumption_summary'),
     
     # Inward reports
     path('inward/daily/', views.get_daily_inward, name='get_daily_inward'),
