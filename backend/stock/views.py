@@ -262,20 +262,21 @@ def create_stock(request):
         base_cost = available_qty * cost_per_unit
         gst_amount = (base_cost * gst) / Decimal('100')
         total_cost = base_cost + gst_amount
+        cost_per_unit_with_gst = cost_per_unit + ((cost_per_unit * gst) / Decimal('100'))
         now_iso = datetime.now().isoformat()
 
-        # Persist with GST fields
+        # Persist with GST-inclusive values
         stock_item = {
             'item_id': item_id,
             'name': item_id,
-            'quantity': int(available_qty),
-            'cost_per_unit': cost_per_unit,
+            'quantity': available_qty,
+            'cost_per_unit': cost_per_unit_with_gst,
             'gst': gst,
             'gst_amount': gst_amount,
             'total_cost': total_cost,
             'stock_limit': stock_limit,
-            'defective': int(defective),
-            'total_quantity': int(quantity),
+            'defective': defective,
+            'total_quantity': quantity,
             'unit': unit,
             'username': username,
             'group_id': group_id,
@@ -288,14 +289,14 @@ def create_stock(request):
         # Log transaction with GST details
         log_transaction("CreateStock", {
             'item_id': item_id,
-            'available_qty': int(available_qty),
-            'defective': int(defective),
-            'total_qty': int(quantity),
-            'cost_per_unit': float(cost_per_unit),
-            'gst': float(gst),
-            'gst_amount': float(gst_amount),
-            'total_cost': float(total_cost),
-            'stock_limit': float(stock_limit),
+            'available_qty': available_qty,
+            'defective': defective,
+            'total_qty': quantity,
+            'cost_per_unit': cost_per_unit,
+            'gst': gst,
+            'gst_amount': gst_amount,
+            'total_cost': total_cost,
+            'stock_limit': stock_limit,
             'unit': unit,
             'group_id': group_id
         }, username)
@@ -314,7 +315,7 @@ def create_stock(request):
             "item_id": item_id,
             "quantity": int(available_qty),
             "total_quantity": int(quantity),
-            "cost_per_unit": float(cost_per_unit),
+            "cost_per_unit": float(cost_per_unit_with_gst),
             "gst": float(gst),
             "gst_amount": float(gst_amount),
             "total_cost": float(total_cost),
