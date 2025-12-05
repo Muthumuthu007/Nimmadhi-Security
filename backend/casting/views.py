@@ -133,13 +133,62 @@ def move_to_production(request):
             )
             return JsonResponse({"error": "Casting product not found"}, status=404)
         
-        # Transfer to production table
+        # Calculate max_produce based on stock availability
+        stocks = dynamodb_service.scan_table('STOCK')
+        stock_map = {item['item_id']: item for item in stocks}
+        
+        stock_needed = casting_product.get('stock_needed', {})
+        max_produce = None
+        cost_breakdown = {}
+        base_cost = Decimal('0')
+        
+        for item_id, qty_needed in stock_needed.items():
+            qty_needed_dec = Decimal(str(qty_needed))
+            if item_id in stock_map:
+                stock_item = stock_map[item_id]
+                available = Decimal(str(stock_item.get('quantity', 0)))
+                possible = available // qty_needed_dec if qty_needed_dec > 0 else Decimal('0')
+                max_produce = possible if max_produce is None else min(max_produce, possible)
+                
+                cpu = Decimal(str(stock_item.get('cost_per_unit', 0)))
+                cost_item = cpu * qty_needed_dec
+                cost_breakdown[item_id] = cost_item
+                base_cost += cost_item
+            else:
+                max_produce = Decimal('0')
+                break
+        
+        if max_produce is None:
+            max_produce = Decimal('0')
+        
+        # Get costs from casting product
+        wastage_pct = Decimal(str(casting_product.get('wastage_percent', 0)))
+        transport_cost = Decimal(str(casting_product.get('transport_cost', 0)))
+        labour_cost = Decimal(str(casting_product.get('labour_cost', 0)))
+        other_cost = Decimal(str(casting_product.get('other_cost', 0)))
+        
+        # Calculate total costs
+        wastage_amt = (base_cost * wastage_pct) / Decimal('100')
+        total_cost = base_cost + wastage_amt + transport_cost + labour_cost + other_cost
+        
+        # Transfer to production table with all required fields
         production_product = {
             'product_id': casting_product['product_id'],
             'product_name': casting_product['product_name'],
-            'stock_needed': casting_product['stock_needed'],
+            'stock_needed': {k: str(v) for k, v in stock_needed.items()},
             'username': casting_product['username'],
-            'created_at': casting_product['created_at'],
+            'max_produce': int(max_produce),
+            'original_max_produce': int(max_produce),
+            'production_cost_breakdown': {k: str(v) for k, v in cost_breakdown.items()},
+            'production_cost_total': base_cost,
+            'wastage_percent': wastage_pct,
+            'wastage_amount': wastage_amt,
+            'transport_cost': transport_cost,
+            'labour_cost': labour_cost,
+            'other_cost': other_cost,
+            'total_cost': total_cost,
+            'inventory': int(max_produce),
+            'created_at': casting_product.get('created_at', datetime.now().isoformat()),
             'moved_to_production_at': datetime.now().isoformat()
         }
         

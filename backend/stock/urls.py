@@ -50,4 +50,5 @@ urlpatterns = [
     # Debug endpoints
     path('debug/stock-items/', views.debug_stock_items, name='debug_stock_items'),
     path('debug/test-lookup/', views.test_stock_lookup, name='test_stock_lookup'),
+    path('debug/token/', views.debug_token, name='debug_token'),
 ]

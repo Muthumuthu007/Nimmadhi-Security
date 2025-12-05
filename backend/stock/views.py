@@ -10,6 +10,8 @@ from django.views.decorators.http import require_http_methods
 from backend.dynamodb_service import dynamodb_service
 from botocore.exceptions import ClientError
 from users.decorators import jwt_required, admin_required
+from users.jwt_utils import decode_jwt_token
+from users.token_manager import TokenManager
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +235,47 @@ def list_groups(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def debug_token(request):
+    """Debug endpoint to test JWT token validation"""
+    try:
+        auth_header = request.META.get('HTTP_AUTHORIZATION')
+        
+        if not auth_header:
+            return JsonResponse({
+                "error": "No Authorization header found",
+                "headers_received": {k: v for k, v in request.META.items() if k.startswith('HTTP_')}
+            }, status=401)
+        
+        if not auth_header.startswith('Bearer '):
+            return JsonResponse({
+                "error": "Authorization header must start with 'Bearer '",
+                "received": auth_header[:50]
+            }, status=401)
+        
+        token = auth_header.split(' ')[1]
+        
+        # Check blacklist
+        if TokenManager.is_token_blacklisted(token):
+            return JsonResponse({"error": "Token is blacklisted"}, status=401)
+        
+        # Decode token
+        payload = decode_jwt_token(token)
+        if not payload:
+            return JsonResponse({
+                "error": "Token decode failed - invalid or expired",
+                "token_preview": token[:20] + "..."
+            }, status=401)
+        
+        return JsonResponse({
+            "message": "Token is valid",
+            "payload": payload
+        })
+        
+    except Exception as e:
+        return JsonResponse({"error": f"Debug error: {str(e)}"}, status=500)
+
+@csrf_exempt
+@require_http_methods(["POST"])
 @jwt_required
 def create_stock(request):
     try:
@@ -255,32 +298,31 @@ def create_stock(request):
         defective = Decimal(str(body['defective']))
         cost_per_unit = Decimal(str(body['cost_per_unit']))
         stock_limit = Decimal(str(body['stock_limit']))
-        gst = Decimal(str(body['gst']))
+        gst_percentage = Decimal(str(body['gst']))
         username = body['username']
         unit = body['unit']
         group_id = body['group_id']
 
         # Validate GST percentage
-        if gst < 0 or gst > 100:
+        if gst_percentage < 0 or gst_percentage > 100:
             return JsonResponse({"error": "GST percentage must be between 0 and 100"}, status=400)
 
         # Compute derived values with GST
         available_qty = quantity - defective
-        base_cost = available_qty * cost_per_unit
-        gst_amount = (base_cost * gst) / Decimal('100')
-        total_cost = base_cost + gst_amount
-        cost_per_unit_with_gst = cost_per_unit + ((cost_per_unit * gst) / Decimal('100'))
+        total_cost = available_qty * cost_per_unit
+        gst_amount = (total_cost * gst_percentage) / Decimal('100')
+        final_total_cost = total_cost + gst_amount
         now_iso = datetime.now().isoformat()
 
-        # Persist with GST-inclusive values
+        # Persist with cost_per_unit unchanged and GST calculated separately
         stock_item = {
             'item_id': item_id,
             'name': item_id,
             'quantity': available_qty,
-            'cost_per_unit': cost_per_unit_with_gst,
-            'gst': gst,
+            'cost_per_unit': cost_per_unit,
+            'gst_percentage': gst_percentage,
             'gst_amount': gst_amount,
-            'total_cost': total_cost,
+            'total_cost': final_total_cost,
             'stock_limit': stock_limit,
             'defective': defective,
             'total_quantity': quantity,
@@ -300,9 +342,9 @@ def create_stock(request):
             'defective': defective,
             'total_qty': quantity,
             'cost_per_unit': cost_per_unit,
-            'gst': gst,
+            'gst_percentage': gst_percentage,
             'gst_amount': gst_amount,
-            'total_cost': total_cost,
+            'total_cost': final_total_cost,
             'stock_limit': stock_limit,
             'unit': unit,
             'group_id': group_id
@@ -322,10 +364,10 @@ def create_stock(request):
             "item_id": item_id,
             "quantity": int(available_qty),
             "total_quantity": int(quantity),
-            "cost_per_unit": float(cost_per_unit_with_gst),
-            "gst": float(gst),
+            "cost_per_unit": float(cost_per_unit),
+            "gst_percentage": float(gst_percentage),
             "gst_amount": float(gst_amount),
-            "total_cost": float(total_cost),
+            "total_cost": float(final_total_cost),
             "stock_limit": float(stock_limit),
             "defective": int(defective),
             "unit": unit,
@@ -337,13 +379,12 @@ def create_stock(request):
         return JsonResponse({"error": f"Internal error: {str(e)}"}, status=500)
 
 @csrf_exempt
-@require_http_methods(["POST"])
+@require_http_methods(["PUT"])
 @jwt_required
 def update_stock(request):
     try:
         body = json.loads(request.body)
         
-        # Must have 'name' (Lambda uses 'name', not 'item_id')
         item_id = body.get('name')
         if not item_id:
             return JsonResponse({"error": "'name' is required"}, status=400)
@@ -352,111 +393,82 @@ def update_stock(request):
         if not existing:
             return JsonResponse({"error": "Stock item not found"}, status=404)
 
-        # DEFECTIVE-ONLY branch (exact Lambda logic)
-        keys = set(body.keys()) - {'operation'}
-        if keys == {'name', 'defective', 'username'}:
-            new_def = int(Decimal(str(body['defective'])))
-            quantity = Decimal(str(existing['quantity']))
-            new_total_quantity = quantity + Decimal(new_def)
+        username = body.get('username')
+        if not username:
+            return JsonResponse({"error": "'username' is required"}, status=400)
 
-            existing.update({
-                'defective': new_def,
-                'total_quantity': new_total_quantity
-            })
-            dynamodb_service.put_item('STOCK', existing)
+        # Get current quantity for recalculation
+        quantity = Decimal(str(existing.get('quantity', 0)))
+        old_state = {}
+        updated = False
 
-            log_transaction("UpdateStockDefectiveOnly", {
-                'item_id': item_id,
-                'old_defective': existing.get('defective', 0),
-                'new_defective': new_def
-            }, body['username'])
+        # Update GST%
+        if 'gst' in body:
+            new_gst = Decimal(str(body['gst']))
+            if new_gst < 0 or new_gst > 100:
+                return JsonResponse({"error": "GST percentage must be between 0 and 100"}, status=400)
+            old_state['gst_percentage'] = existing.get('gst_percentage', 0)
+            existing['gst_percentage'] = new_gst
+            updated = True
 
-            log_undo_action("UpdateStockDefectiveOnly", {
-                'item_id': item_id,
-                'old_defective': existing.get('defective', 0)
-            }, body['username'])
+        # Update COST_PER_UNIT
+        if 'cost_per_unit' in body:
+            old_state['cost_per_unit'] = existing.get('cost_per_unit', 0)
+            existing['cost_per_unit'] = Decimal(str(body['cost_per_unit']))
+            updated = True
 
-            recalc_all_production()
+        # Update UNIT
+        if 'unit' in body:
+            old_state['unit'] = existing.get('unit', '')
+            existing['unit'] = body['unit']
+            updated = True
 
-            return JsonResponse({
-                "message": "Defective count updated. Quantity unchanged. Total quantity recalculated.",
-                "item_id": item_id,
-                "defective": new_def,
-                "quantity": float(quantity),
-                "total_quantity": float(new_total_quantity)
-            })
+        # Update STOCK_LIMIT
+        if 'stock_limit' in body:
+            old_state['stock_limit'] = existing.get('stock_limit', 0)
+            existing['stock_limit'] = Decimal(str(body['stock_limit']))
+            updated = True
 
-        # FULL-UPDATE branch (exact Lambda logic)
-        required = ['name', 'quantity', 'defective', 'cost_per_unit', 'stock_limit', 'unit', 'username']
-        for field in required:
-            if field not in body:
-                return JsonResponse({"error": f"'{field}' is required"}, status=400)
+        if not updated:
+            return JsonResponse({"error": "No valid fields to update"}, status=400)
 
-        # Parse exactly like Lambda
-        new_qty = Decimal(str(body['quantity']))
-        new_def = int(Decimal(str(body['defective'])))
-        new_cpu = Decimal(str(body['cost_per_unit']))
-        new_stock_lim = Decimal(str(body['stock_limit']))
-        new_unit = body['unit']
-        username = body['username']
+        # Recalculate total_cost with new values
+        cost_per_unit = Decimal(str(existing.get('cost_per_unit', 0)))
+        gst_percentage = Decimal(str(existing.get('gst_percentage', 0)))
+        base_cost = quantity * cost_per_unit
+        gst_amount = (base_cost * gst_percentage) / Decimal('100')
+        total_cost = base_cost + gst_amount
 
-        # Calculate total_cost
-        total_cost = new_qty * new_cpu
-        new_total_quantity = new_qty + Decimal(new_def)
-        now_str = datetime.now().isoformat()
+        existing['gst_amount'] = gst_amount
+        existing['total_cost'] = total_cost
+        existing['updated_at'] = datetime.now().isoformat()
 
-        # Preserve old state for logging
-        old_state = {
-            'quantity': existing.get('quantity', 0),
-            'total_quantity': existing.get('total_quantity', 0),
-            'defective': existing.get('defective', 0),
-            'cost_per_unit': existing.get('cost_per_unit', 0),
-            'stock_limit': existing.get('stock_limit', 0)
-        }
-
-        # Update all fields
-        existing.update({
-            'quantity': new_qty,
-            'total_quantity': new_total_quantity,
-            'defective': new_def,
-            'cost_per_unit': new_cpu,
-            'total_cost': total_cost,
-            'stock_limit': new_stock_lim,
-            'unit': new_unit,
-            'updated_at': now_str
-        })
-        
         dynamodb_service.put_item('STOCK', existing)
 
         log_transaction("UpdateStock", {
             'item_id': item_id,
-            'old_quantity': old_state['quantity'],
-            'new_quantity': float(new_qty),
-            'old_total_quantity': old_state['total_quantity'],
-            'new_total_quantity': float(new_total_quantity),
-            'old_defective': old_state['defective'],
-            'new_defective': new_def,
-            'old_cost_per_unit': float(old_state['cost_per_unit']),
-            'new_cost_per_unit': float(new_cpu),
-            'old_stock_limit': old_state['stock_limit'],
-            'new_stock_limit': float(new_stock_lim),
-            'new_total_cost': float(total_cost)
+            'old_values': {k: float(v) if isinstance(v, Decimal) else v for k, v in old_state.items()},
+            'new_gst_percentage': float(gst_percentage),
+            'new_cost_per_unit': float(cost_per_unit),
+            'new_unit': existing.get('unit'),
+            'new_stock_limit': float(existing.get('stock_limit', 0)),
+            'recalculated_total_cost': float(total_cost)
         }, username)
 
         log_undo_action("UpdateStock", {'item_id': item_id, 'old_state': old_state}, username)
         recalc_all_production()
-        
+
         return JsonResponse({
-            "message": "Stock updated successfully. Quantity and total_quantity updated.",
+            "message": "Stock updated successfully",
             "item_id": item_id,
-            "quantity": float(new_qty),
-            "total_quantity": float(new_total_quantity),
-            "defective": new_def,
-            "cost_per_unit": float(new_cpu),
+            "cost_per_unit": float(cost_per_unit),
+            "gst_percentage": float(gst_percentage),
+            "gst_amount": float(gst_amount),
             "total_cost": float(total_cost),
-            "stock_limit": float(new_stock_lim),
-            "unit": new_unit,
-            "username": username
+            "unit": existing.get('unit'),
+            "stock_limit": float(existing.get('stock_limit', 0)),
+            "quantity": float(quantity),
+            "updated_at": existing['updated_at']
         })
         
     except Exception as e:
@@ -674,13 +686,13 @@ def add_stock_quantity(request):
         before_total = before_available + before_defective
         before_total_cost = Decimal(str(existing.get('total_cost', 0)))
         cost_per_unit = Decimal(str(existing.get('cost_per_unit', 0)))
-        gst = Decimal(str(existing.get('gst', 0)))
+        gst_percentage = Decimal(str(existing.get('gst_percentage', 0)))
 
         # Compute after values with GST
         after_available = before_available + q_add
         after_total = after_available + before_defective
         base_added_cost = cost_per_unit * q_add
-        gst_amount = (base_added_cost * gst) / Decimal('100')
+        gst_amount = (base_added_cost * gst_percentage) / Decimal('100')
         added_cost = base_added_cost + gst_amount
         after_total_cost = before_total_cost + added_cost
         now_ts = datetime.now().isoformat()
@@ -700,7 +712,7 @@ def add_stock_quantity(request):
             "item_id": item_id,
             "quantity_added": float(q_add),
             "cost_per_unit": float(cost_per_unit),
-            "gst": float(gst),
+            "gst_percentage": float(gst_percentage),
             "gst_amount": float(gst_amount),
             "added_cost": float(added_cost),
             "before_available": float(before_available),
@@ -723,22 +735,20 @@ def add_stock_quantity(request):
 
         recalc_all_production()
         
-        response_data = {
+        return JsonResponse({
             "message": f"Added {float(q_add)} units to stock '{item_id}'.",
             "item_id": item_id,
             "quantity_added": float(q_add),
             "new_available": float(after_available),
             "new_total": float(after_total),
-            "gst": float(gst),
+            "cost_per_unit": float(cost_per_unit),
+            "gst_percentage": float(gst_percentage),
             "gst_amount": float(gst_amount),
             "added_cost": float(added_cost),
             "new_total_cost": float(after_total_cost),
+            "supplier_name": supplier_name,
             "updated_at": now_ts
-        }
-        
-        response_data["supplier_name"] = supplier_name
-            
-        return JsonResponse(response_data)
+        })
         
     except Exception as e:
         logger.error(f"Error in add_stock_quantity: {e}")
@@ -1386,7 +1396,6 @@ def create_product(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
-@jwt_required
 def update_product(request):
     try:
         body = json.loads(request.body)
@@ -1647,7 +1656,6 @@ def debug_stock_items(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
-@jwt_required
 def alter_product_components(request):
     try:
         body = json.loads(request.body)
