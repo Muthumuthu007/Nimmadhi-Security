@@ -40,6 +40,8 @@ class InwardService:
             "stock_name": "",
             "inward_quantity": 0,
             "added_cost": 0,
+            "gst_percentage": 0,
+            "gst_amount": 0,
             "existing_quantity": None,
             "new_quantity": None
         }))
@@ -60,10 +62,16 @@ class InwardService:
             stock_item = dynamodb_service.get_item('STOCK', {"item_id": item_id})
             stock_name = stock_item.get("name", item_id) if stock_item else item_id
             
+            # Extract GST details from transaction
+            gst_percentage = float(details.get("gst_percentage", 0))
+            gst_amount = float(details.get("gst_amount", 0))
+            
             item = aggregated[date_str][item_id]
             item["stock_name"] = stock_name
             item["inward_quantity"] += quantity_added
             item["added_cost"] += added_cost
+            item["gst_percentage"] = gst_percentage
+            item["gst_amount"] += gst_amount
             item["new_quantity"] = new_available
             if item["existing_quantity"] is None:
                 item["existing_quantity"] = existing_qty
@@ -77,6 +85,8 @@ class InwardService:
                     "existing_quantity": data["existing_quantity"],
                     "inward_quantity": data["inward_quantity"],
                     "new_quantity": data["new_quantity"],
+                    "gst_percentage": data["gst_percentage"],
+                    "gst_amount": data["gst_amount"],
                     "added_cost": data["added_cost"],
                     "date": date_str
                 })

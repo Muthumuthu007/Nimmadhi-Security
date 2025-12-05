@@ -47,6 +47,13 @@ class DynamoDBService:
         try:
             table = self.get_table(table_key)
             response = table.put_item(Item=item)
+            # Clear cache after write
+            cache_pattern = f"scan_{table_key}_"
+            try:
+                cache.delete_pattern(cache_pattern + '*')
+            except:
+                pass
+            logger.info(f"✓ Put item to {table_key}: {item.get('transaction_id', item.get('item_id', 'unknown'))}")
             return response
         except ClientError as e:
             logger.error(f"Error putting item to {table_key}: {e}")

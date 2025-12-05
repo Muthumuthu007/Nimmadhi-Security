@@ -26,20 +26,21 @@ class DecimalEncoder(json.JSONEncoder):
 # Helper functions for stock operations
 def log_transaction(action, data, username):
     """Log transaction for audit trail"""
-    try:
-        transaction_id = str(uuid.uuid4())
-        transaction_data = {
-            'transaction_id': transaction_id,
-            'operation_type': action,
-            'date': datetime.now().strftime('%Y-%m-%d'),
-            'timestamp': datetime.now().isoformat(),
-            'username': username,
-            'details': data
-        }
-        dynamodb_service.put_item('stock_transactions', transaction_data)
-        logger.info(f"Transaction logged: {action} by {username}")
-    except Exception as e:
-        logger.error(f"Error logging transaction: {e}")
+    transaction_id = str(uuid.uuid4())
+    now = datetime.now()
+    transaction_data = {
+        'transaction_id': transaction_id,
+        'operation_type': action,
+        'date': now.strftime('%Y-%m-%d'),
+        'timestamp': now.isoformat(),
+        'username': username,
+        'details': data
+    }
+    print(f"[LOG_TRANSACTION] Attempting to log {action} - ID: {transaction_id}")
+    dynamodb_service.put_item('stock_transactions', transaction_data)
+    print(f"[LOG_TRANSACTION] ✓ Successfully logged {action}")
+    logger.info(f"✓ Transaction logged: {action} by {username} on {transaction_data['date']} - ID: {transaction_id}")
+    return transaction_id
 
 def log_undo_action(action, data, username):
     """Log undo action for rollback capability"""
@@ -707,30 +708,29 @@ def add_stock_quantity(request):
         })
         dynamodb_service.put_item('STOCK', existing)
         
-        # Log with GST details
+        # Log with GST details - keep as Decimal for DynamoDB
         transaction_data = {
             "item_id": item_id,
-            "quantity_added": float(q_add),
-            "cost_per_unit": float(cost_per_unit),
-            "gst_percentage": float(gst_percentage),
-            "gst_amount": float(gst_amount),
-            "added_cost": float(added_cost),
-            "before_available": float(before_available),
-            "before_defective": float(before_defective),
-            "before_total": float(before_total),
-            "before_total_cost": float(before_total_cost),
-            "after_available": float(after_available),
-            "after_total": float(after_total),
-            "after_total_cost": float(after_total_cost),
+            "quantity_added": q_add,
+            "cost_per_unit": cost_per_unit,
+            "gst_percentage": gst_percentage,
+            "gst_amount": gst_amount,
+            "added_cost": added_cost,
+            "before_available": before_available,
+            "before_defective": before_defective,
+            "before_total": before_total,
+            "before_total_cost": before_total_cost,
+            "new_available": after_available,
+            "new_total": after_total,
+            "new_total_cost": after_total_cost,
+            "supplier_name": supplier_name
         }
-        
-        transaction_data["supplier_name"] = supplier_name
             
         log_transaction("AddStockQuantity", transaction_data, username)
 
         log_undo_action("AddStockQuantity", {
             "item_id": item_id,
-            "quantity_added": float(q_add)
+            "quantity_added": q_add
         }, username)
 
         recalc_all_production()
